@@ -1,0 +1,8 @@
+sqlr
+sqlr-asan
+t/work/
+*.o
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
