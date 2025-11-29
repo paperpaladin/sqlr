@@ -292,17 +292,75 @@ static int seen_mark(Scan *s, uint32_t pg) {
 	return 0;
 }
 
-/* Point at a cell's payload. For now the whole payload must live on the leaf
- * page; a payload long enough to spill is refused rather than half-read.
- * shortcut: overflow pages arrive in the next commit, which is what makes the
- * refusal below temporary rather than a limit of the design. */
+static uint8_t *rec_room(Scan *s, size_t need) {
+	if (need > s->reccap) {
+		s->reccap = need < 512 ? 512 : need;
+		free(s->rec);
+		s->rec = xmalloc(s->reccap);
+	}
+	return s->rec;
+}
+
+/* How much of a leaf cell's payload lives on the leaf page itself.
+ *
+ * X is the largest payload a leaf cell may hold without spilling: the usable
+ * size minus 35, the worst-case cell overhead. If the payload is bigger,
+ * SQLite does NOT simply store X bytes locally. It stores either M bytes or
+ * K bytes, chosen so the final overflow page is as full as possible while the
+ * local part stays >= M. M is the minimum local payload, 32/255ths of the
+ * usable space minus the header allowance; K is M plus however much of the
+ * surplus does not divide evenly into whole overflow pages (each of which
+ * carries usable-4 bytes, the 4 being the next-page pointer). If that K still
+ * fits on the page, use it; otherwise fall back to M. Getting this wrong
+ * silently misreads every long value in the database, so it is spelled out. */
+static uint32_t local_payload(uint32_t usable, uint64_t p) {
+	uint32_t x = usable - 35;
+	if (p <= x) return (uint32_t)p;
+	uint32_t m = ((usable - 12) * 32 / 255) - 23;
+	uint32_t k = m + (uint32_t)((p - m) % (usable - 4));
+	return (k <= x) ? k : m;
+}
+
+/* Copy a cell's full payload (local part plus the overflow chain) into the
+ * scan's record buffer. */
 static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
                         size_t page_room, const uint8_t **out) {
-	(void)s;
-	if (plen > page_room)
-		return err("cell payload of %" PRIu64 " bytes spills to an overflow page, "
-		           "which sqlr cannot read yet", plen);
-	*out = cell_payload;
+	Db *db = s->db;
+	uint32_t local = local_payload(db->usable, plen);
+
+	/* A payload cannot be larger than the bytes the file actually contains;
+	 * checking that first turns a corrupt length into an error instead of a
+	 * multi-gigabyte malloc. */
+	if (plen > (uint64_t)db->npages * db->usable)
+		return err("cell payload of %" PRIu64 " bytes exceeds the whole database", plen);
+	if (local > page_room)
+		return err("cell payload of %u local bytes runs past the end of its page", local);
+
+	if (plen == local) { /* no overflow: read it in place, no copy */
+		*out = cell_payload;
+		return 0;
+	}
+
+	uint8_t *buf = rec_room(s, (size_t)plen);
+	memcpy(buf, cell_payload, local);
+	size_t got = local;
+	uint32_t next = be32(cell_payload + local);
+
+	/* The 4 bytes after the local payload are the first overflow page number;
+	 * each overflow page is 4 bytes of "next page, or 0" then raw payload. */
+	seen_clear(s);
+	while (got < plen) {
+		if (next == 0) return err("overflow chain ended %zu bytes early", (size_t)plen - got);
+		if (seen_mark(s, next)) return err("overflow chain loops back to page %u", next);
+		const uint8_t *op = page_at(db, next);
+		if (!op) return -1;
+		size_t chunk = db->usable - 4;
+		if (chunk > plen - got) chunk = plen - got;
+		memcpy(buf + got, op + 4, chunk);
+		got += chunk;
+		next = be32(op);
+	}
+	*out = buf;
 	return 0;
 }
 
