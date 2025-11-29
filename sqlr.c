@@ -257,23 +257,39 @@ static int rec_parse(const uint8_t *p, size_t plen, Val *v, int *nout) {
 
 /* --------------------------------------------------------- payload assembly */
 
-/* Per-scan scratch: one growable buffer that every record is assembled into.
- * shortcut: a scan allocates once and reuses, because a full table scan touches
- * every row and a malloc per row would dominate. */
+/* Per-scan scratch: a growable record buffer and a visited-page bitmap. The
+ * bitmap is what stops a corrupt file whose page pointers form a cycle from
+ * looping forever -- a read-only parser must terminate on any input. */
 typedef struct {
 	Db *db;
 	uint8_t *rec;
 	size_t reccap;
+	uint8_t *seen;
+	size_t seenbytes;
 } Scan;
 
 static void scan_init(Scan *s, Db *db) {
 	s->db = db;
 	s->rec = NULL;
 	s->reccap = 0;
+	s->seenbytes = db->npages / 8 + 1;
+	s->seen = xmalloc(s->seenbytes);
 }
 
 static void scan_free(Scan *s) {
 	free(s->rec);
+	free(s->seen);
+}
+
+static void seen_clear(Scan *s) { memset(s->seen, 0, s->seenbytes); }
+
+static int seen_mark(Scan *s, uint32_t pg) {
+	size_t byte = pg / 8;
+	uint8_t bit = (uint8_t)(1u << (pg % 8));
+	if (byte >= s->seenbytes) return 0;
+	if (s->seen[byte] & bit) return 1; /* already visited: a cycle */
+	s->seen[byte] |= bit;
+	return 0;
 }
 
 /* Point at a cell's payload. For now the whole payload must live on the leaf
@@ -294,14 +310,16 @@ static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
 
 typedef int (*RowFn)(void *ctx, int64_t rowid, const uint8_t *payload, size_t plen);
 
-/* shortcut: table leaf pages only (page type 13). Interior pages (type 5) and
- * index pages (2 and 10) are recognised and refused, so a database whose table
- * has grown past one page errors instead of silently returning a fraction of
- * its rows -- which is the failure mode this would otherwise have. Interior
- * pages arrive in the next commit. */
+/* shortcut: table b-trees only (page types 5 and 13). Index b-trees (2 and 10)
+ * are recognised and refused; nothing here needs them because every query is a
+ * full table scan. Upgrade path: index leaf cells are the same record format
+ * with the rowid as the trailing column, so adding them is a new cell decoder
+ * plus a seek, not a redesign. */
 static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
 	Db *db = s->db;
-	(void)depth;
+	if (depth > 40) return err("b-tree deeper than 40 levels; refusing to recurse");
+	if (seen_mark(s, pgno)) return err("b-tree revisits page %u (corrupt)", pgno);
+
 	const uint8_t *pg = page_at(db, pgno);
 	if (!pg) return -1;
 	/* Page 1 is unique: the 100-byte database header sits in front of its
@@ -309,15 +327,14 @@ static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
 	uint32_t off = (pgno == 1) ? 100 : 0;
 	const uint8_t *h = pg + off;
 	uint8_t type = h[0];
-	if (type != 13) {
-		if (type == 5)
-			return err("page %u is a table interior page, which sqlr cannot read yet", pgno);
+	if (type != 5 && type != 13) {
 		if (type == 2 || type == 10)
 			return err("page %u is an index b-tree page; sqlr reads table b-trees only", pgno);
 		return err("page %u has unknown b-tree page type %u", pgno, type);
 	}
 	uint32_t ncell = be16(h + 3);
-	uint32_t cellptr = off + 8;
+	uint32_t hsize = (type == 5) ? 12 : 8;
+	uint32_t cellptr = off + hsize;
 	if (cellptr + 2 * ncell > db->usable)
 		return err("page %u claims %u cells, which overruns the page", pgno, ncell);
 
@@ -328,23 +345,36 @@ static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
 		const uint8_t *c = pg + co;
 		const uint8_t *cend = pg + db->usable;
 
-		/* Leaf table cell: varint total payload length, varint rowid, then the
-		 * payload. */
-		uint64_t plen, rowid;
-		int k = varint(c, cend, &plen);
-		if (k < 0) return err("page %u cell %u: bad payload length varint", pgno, i);
-		c += k;
-		k = varint(c, cend, &rowid);
-		if (k < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
-		c += k;
-		const uint8_t *pay;
-		if (payload_read(s, c, plen, (size_t)(cend - c), &pay) < 0) return -1;
-		if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+		if (type == 5) {
+			/* Interior table cell: 4-byte left child page number, then a
+			 * varint rowid we do not need for a full scan. */
+			if (cend - c < 4) return err("page %u cell %u truncated", pgno, i);
+			if (walk(s, be32(c), depth + 1, fn, ctx) < 0) return -1;
+		} else {
+			/* Leaf table cell: varint total payload length, varint rowid,
+			 * then the payload. */
+			uint64_t plen, rowid;
+			int k = varint(c, cend, &plen);
+			if (k < 0) return err("page %u cell %u: bad payload length varint", pgno, i);
+			c += k;
+			k = varint(c, cend, &rowid);
+			if (k < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
+			c += k;
+			const uint8_t *pay;
+			if (payload_read(s, c, plen, (size_t)(cend - c), &pay) < 0) return -1;
+			if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+		}
+	}
+	if (type == 5) {
+		/* The right-most child hangs off the page header, not the cell array;
+		 * visiting it last is what keeps a scan in rowid order. */
+		if (walk(s, be32(h + 8), depth + 1, fn, ctx) < 0) return -1;
 	}
 	return 0;
 }
 
 static int scan_table(Scan *s, uint32_t root, RowFn fn, void *ctx) {
+	seen_clear(s);
 	return walk(s, root, 0, fn, ctx);
 }
 
