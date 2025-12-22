@@ -766,6 +766,91 @@ static int word(const char **p, const char *kw) {
 	return 1;
 }
 
+static int hexval(int c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Literals: NULL, integer, real, 'text with '' escapes', X'hex'. */
+static int parse_literal(const char **pp, Val *v, uint8_t **own) {
+	const char *p = *pp;
+	skipws(&p);
+	memset(v, 0, sizeof *v);
+	*own = NULL;
+	if (word(&p, "null")) { v->t = V_NULL; *pp = p; return 0; }
+	if ((*p == 'x' || *p == 'X') && p[1] == '\'') {
+		p += 2;
+		const char *st = p;
+		while (*p && *p != '\'') p++;
+		if (*p != '\'') return err("unterminated blob literal");
+		size_t nh = (size_t)(p - st);
+		if (nh % 2) return err("blob literal has an odd number of hex digits");
+		uint8_t *b = xmalloc(nh / 2 + 1);
+		for (size_t i = 0; i < nh; i += 2) {
+			int hi = hexval(st[i]), lo = hexval(st[i + 1]);
+			if (hi < 0 || lo < 0) { free(b); return err("bad hex digit in blob literal"); }
+			b[i / 2] = (uint8_t)(hi << 4 | lo);
+		}
+		v->t = V_BLOB;
+		v->s = b;
+		v->n = (uint32_t)(nh / 2);
+		*own = b;
+		*pp = p + 1;
+		return 0;
+	}
+	if (*p == '\'') {
+		p++;
+		char *out = xmalloc(strlen(p) + 1);
+		size_t k = 0;
+		while (*p) {
+			if (*p == '\'') {
+				if (p[1] == '\'') { out[k++] = '\''; p += 2; continue; }
+				p++;
+				v->t = V_TEXT;
+				v->s = (uint8_t *)out;
+				v->n = (uint32_t)k;
+				*own = (uint8_t *)out;
+				*pp = p;
+				return 0;
+			}
+			out[k++] = *p++;
+		}
+		free(out);
+		return err("unterminated string literal");
+	}
+	{
+		char *endp = NULL;
+		const char *st = p;
+		int isreal = 0;
+		if (*p == '+' || *p == '-') p++;
+		if (!isdigit((unsigned char)*p) && *p != '.') return err("expected a literal value");
+		while (isdigit((unsigned char)*p)) p++;
+		if (*p == '.' || *p == 'e' || *p == 'E') isreal = 1;
+		if (isreal) {
+			double d = strtod(st, &endp);
+			if (endp == st) return err("bad numeric literal");
+			v->t = V_REAL;
+			v->r = d;
+			*pp = endp;
+		} else {
+			errno = 0;
+			long long n = strtoll(st, &endp, 10);
+			if (endp == st) return err("bad integer literal");
+			if (errno == ERANGE) { /* out of int64 range: SQLite makes it a REAL */
+				v->t = V_REAL;
+				v->r = strtod(st, &endp);
+			} else {
+				v->t = V_INT;
+				v->i = n;
+			}
+			*pp = endp;
+		}
+		return 0;
+	}
+}
+
 static int col_index(Table *t, const char *name) {
 	for (int i = 0; i < t->ncol; i++)
 		if (ci_eq(t->col[i], name)) return i;
@@ -824,9 +909,113 @@ static int query_parse(Query *q, Schema *sc, const char *sql, Table **tout) {
 	}
 
 	skipws(&p);
+	if (*p == 0 || *p == ';') return 0;
+	if (!word(&p, "where")) return err("unexpected trailing input: %s", p);
+
+	char *wname = ident(&p);
+	if (!wname) return err("expected a column name after WHERE");
+	q->wcol = col_index(t, wname);
+	if (q->wcol == -2) {
+		err("no such column: %s", wname);
+		free(wname);
+		return -1;
+	}
+	free(wname);
+
+	skipws(&p);
+	if (word(&p, "is")) {
+		int neg = word(&p, "not");
+		if (!word(&p, "null")) return err("expected NULL after IS");
+		q->op = neg ? OP_NOTNULL : OP_ISNULL;
+	} else {
+		if (p[0] == '=' && p[1] == '=') { q->op = OP_EQ; p += 2; }
+		else if (p[0] == '=') { q->op = OP_EQ; p += 1; }
+		else if (p[0] == '!' && p[1] == '=') { q->op = OP_NE; p += 2; }
+		else if (p[0] == '<' && p[1] == '>') { q->op = OP_NE; p += 2; }
+		else if (p[0] == '<' && p[1] == '=') { q->op = OP_LE; p += 2; }
+		else if (p[0] == '>' && p[1] == '=') { q->op = OP_GE; p += 2; }
+		else if (p[0] == '<') { q->op = OP_LT; p += 1; }
+		else if (p[0] == '>') { q->op = OP_GT; p += 1; }
+		else return err("unsupported operator at: %s", p);
+		if (parse_literal(&p, &q->wval, &q->wbuf) < 0) return -1;
+	}
+	skipws(&p);
 	if (*p == ';') { p++; skipws(&p); }
 	if (*p) return err("unexpected trailing input: %s", p);
 	return 0;
+}
+
+/* ------------------------------------------------- comparison and affinity */
+
+/* Storage classes sort NULL < numeric < text < blob, and that ordering is what
+ * makes 'abc' > 99 true in SQLite. */
+static int classof(const Val *v) {
+	switch (v->t) {
+	case V_NULL: return 0;
+	case V_INT: case V_REAL: return 1;
+	case V_TEXT: return 2;
+	default: return 3;
+	}
+}
+
+static int cmp_vals(const Val *a, const Val *b) {
+	int ca = classof(a), cb = classof(b);
+	if (ca != cb) return ca < cb ? -1 : 1;
+	switch (ca) {
+	case 0: return 0;
+	case 1: {
+		if (a->t == V_INT && b->t == V_INT) return a->i < b->i ? -1 : a->i > b->i ? 1 : 0;
+		double x = a->t == V_INT ? (double)a->i : a->r;
+		double y = b->t == V_INT ? (double)b->i : b->r;
+		return x < y ? -1 : x > y ? 1 : 0;
+	}
+	default: {
+		uint32_t n = a->n < b->n ? a->n : b->n;
+		int c = n ? memcmp(a->s, b->s, n) : 0;
+		if (c) return c < 0 ? -1 : 1;
+		return a->n < b->n ? -1 : a->n > b->n ? 1 : 0;
+	}
+	}
+}
+
+/* Apply a column's affinity to the literal side of the comparison, which is
+ * what SQLite does before comparing. The stored value already had affinity
+ * applied when it was inserted, so only the literal needs converting. */
+static void apply_affinity(Aff a, Val *v, char *scratch, size_t slen) {
+	if (a == AFF_TEXT && (v->t == V_INT || v->t == V_REAL)) {
+		if (v->t == V_INT) snprintf(scratch, slen, "%" PRId64, v->i);
+		else {
+			FILE *m = fmemopen(scratch, slen, "w");
+			if (!m) return;
+			put_real(m, v->r);
+			fclose(m);
+		}
+		v->t = V_TEXT;
+		v->s = (uint8_t *)scratch;
+		v->n = (uint32_t)strlen(scratch);
+		return;
+	}
+	if ((a == AFF_INT || a == AFF_REAL || a == AFF_NUM) && v->t == V_TEXT) {
+		/* Numeric affinity converts text only if it is a complete, well-formed
+		 * number; otherwise the text is left alone. */
+		if (v->n >= slen) return;
+		memcpy(scratch, v->s, v->n);
+		scratch[v->n] = 0;
+		char *e = NULL;
+		errno = 0;
+		long long n = strtoll(scratch, &e, 10);
+		if (e && *e == 0 && e != scratch && errno != ERANGE) {
+			v->t = V_INT;
+			v->i = n;
+			return;
+		}
+		e = NULL;
+		double d = strtod(scratch, &e);
+		if (e && *e == 0 && e != scratch) {
+			v->t = V_REAL;
+			v->r = d;
+		}
+	}
 }
 
 /* --------------------------------------------------------------- the scan */
@@ -863,6 +1052,33 @@ static int emit_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
 		v[t->ipk].i = rowid;
 	}
 	Val rid = {V_INT, rowid, 0, NULL, 0};
+
+	if (q->op != OP_NONE) {
+		const Val *cv = (q->wcol < 0) ? &rid : &v[q->wcol];
+		if (q->op == OP_ISNULL) {
+			if (cv->t != V_NULL) return 0;
+		} else if (q->op == OP_NOTNULL) {
+			if (cv->t == V_NULL) return 0;
+		} else {
+			/* NULL compares unknown, so a NULL row never matches =, <, etc. */
+			if (cv->t == V_NULL || q->wval.t == V_NULL) return 0;
+			char scratch[64];
+			Val lit = q->wval;
+			apply_affinity(e->waff, &lit, scratch, sizeof scratch);
+			int c = cmp_vals(cv, &lit);
+			int ok = 0;
+			switch (q->op) {
+			case OP_EQ: ok = (c == 0); break;
+			case OP_NE: ok = (c != 0); break;
+			case OP_LT: ok = (c < 0); break;
+			case OP_LE: ok = (c <= 0); break;
+			case OP_GT: ok = (c > 0); break;
+			case OP_GE: ok = (c >= 0); break;
+			default: break;
+			}
+			if (!ok) return 0;
+		}
+	}
 
 	for (int i = 0; i < q->nsel; i++) {
 		if (i) fputc('\t', e->out);
