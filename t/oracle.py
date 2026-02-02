@@ -284,6 +284,12 @@ def build_corpus():
     for r in [0.1, 1 / 3, -2.5, 1e300, 1e-300, 1e21, 123456789012345.6,
               3.141592653589793, 5e-324]:
         data.append((None, None, r, None, None))
+    # REALs whose value is an exact integer. SQLite shrinks these to an INTEGER
+    # serial type on disk and re-floats them on read, so nothing in the record
+    # says the value was ever a float -- a reader that trusts the serial type
+    # prints 1 where sqlite3 prints 1.0.
+    for r in [0.0, -0.0, 1.0, -1.0, 7.0, 1e16, 2.0 ** 53, -(2.0 ** 53)]:
+        data.append((None, None, r, None, None))
     # Blobs containing NUL bytes and every byte value; UTF-8 text.
     data.append((1, "ascii", 1.5, bytes(range(256)), None))
     data.append((2, "héllo wörld é中文 \U0001f600", 2.5, b"\x00\x00\x00", None))
