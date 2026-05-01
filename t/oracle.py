@@ -365,6 +365,85 @@ def build_corpus():
     q(db, "SELECT id FROM d WHERE id > 49998")
     meta(db, ".dbinfo")
 
+    # 5. Non-contiguous rowids after deletes, plus an explicit rowid gap, so the
+    #    scan cannot assume rowid == position.
+    db = make("gaps", """
+        CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT);
+        INSERT INTO g VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+        DELETE FROM g WHERE id IN (2,4);
+        INSERT INTO g VALUES(1000,'far'),(-5,'negative');
+        INSERT INTO g(v) VALUES('auto');
+    """)
+    meta(db, ".dbinfo")
+    q(db, "SELECT * FROM g")
+    q(db, "SELECT rowid, id, v FROM g")
+    q(db, "SELECT v FROM g WHERE id = -5")
+
+    # A table with no INTEGER PRIMARY KEY at all: rowid is hidden, and every
+    # column really is stored in the record.
+    db = make("norowid", """
+        CREATE TABLE p(a TEXT, b INTEGER);
+        INSERT INTO p VALUES('x',1),('y',2);
+        DELETE FROM p WHERE a='x';
+        INSERT INTO p VALUES('z',3);
+    """)
+    q(db, "SELECT rowid, a, b FROM p")
+    q(db, "SELECT * FROM p")
+
+    # 6. ALTER TABLE ADD COLUMN: rows written before the ALTER have short
+    #    records and the missing trailing columns must read as NULL.
+    db = make("altered", """
+        CREATE TABLE a(x INTEGER);
+        INSERT INTO a VALUES(1),(2);
+        ALTER TABLE a ADD COLUMN y TEXT;
+        INSERT INTO a VALUES(3,'three');
+        ALTER TABLE a ADD COLUMN z REAL;
+        INSERT INTO a VALUES(4,'four',4.5);
+    """)
+    q(db, "SELECT * FROM a")
+    q(db, "SELECT * FROM a", json=True)
+    q(db, "SELECT x, z FROM a WHERE z IS NULL")
+
+    # 7. Page sizes other than the default, including the 65536 case that the
+    #    header encodes as the value 1.
+    for psize in (512, 1024, 8192, 65536):
+        db = make("ps%d" % psize,
+                  "CREATE TABLE s(i INTEGER, t TEXT);",
+                  [("INSERT INTO s VALUES(?,?)",
+                    [(i, "p%d-%d" % (psize, i)) for i in range(300)])],
+                  page_size=psize)
+        q(db, "SELECT * FROM s")
+        q(db, "SELECT t FROM s WHERE i = 299")
+        meta(db, ".dbinfo")
+
+    # 8. An index exists; sqlr ignores it and scans. Queries are chosen so the
+    #    answer is order-identical whether SQLite uses the index or not.
+    db = make("indexed", """
+        CREATE TABLE ix(k TEXT, v INTEGER);
+        INSERT INTO ix VALUES('a',1),('b',2),('c',3),('a',4);
+        CREATE INDEX ix_k ON ix(k);
+    """)
+    meta(db, ".schema")
+    q(db, "SELECT * FROM ix")
+    q(db, "SELECT * FROM ix WHERE k = 'a'")
+
+    # 10. Affinity in the WHERE clause: comparing a text literal against an
+    #     INTEGER column and a numeric literal against a TEXT column is where
+    #     SQLite's conversion rules bite.
+    db = make("affin", """
+        CREATE TABLE af(i INTEGER, t TEXT, n NUMERIC, noaff);
+        INSERT INTO af VALUES(5,'5',5,5);
+        INSERT INTO af VALUES(10,'10',10,'10');
+        INSERT INTO af VALUES(0,'abc',0,'abc');
+    """)
+    q(db, "SELECT * FROM af WHERE i = '5'")
+    q(db, "SELECT * FROM af WHERE t = 5")
+    q(db, "SELECT * FROM af WHERE t = '5'")
+    q(db, "SELECT * FROM af WHERE n = '10'")
+    q(db, "SELECT * FROM af WHERE noaff = 5")
+    q(db, "SELECT * FROM af WHERE noaff = '5'")
+    q(db, "SELECT * FROM af WHERE i > '5'")
+
     return WORK
 
 
@@ -401,6 +480,68 @@ def compare_cases():
 # ---------------------------------------------------------- loud refusals
 # Things sqlr does not support must fail with a message, not silently lie.
 
+def refusals():
+    db = make("wor", """
+        CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;
+        INSERT INTO w VALUES('a',1),('b',2);
+    """)
+    p = run([db, "SELECT * FROM w"])
+    check(p.returncode == 1 and b"WITHOUT ROWID" in p.stderr,
+          "WITHOUT ROWID table is refused loudly",
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+
+    db2 = CASES[0][0]
+    for bad, needle in (
+        ("SELECT * FROM nosuchtable", b"no such table"),
+        ("SELECT nosuchcol FROM one", b"no such column"),
+        ("UPDATE one SET a=1", b"only SELECT"),
+        ("SELECT * FROM one WHERE a = 1 ORDER BY a", b"trailing"),
+        ("SELECT * FROM one JOIN one", b"trailing"),
+        ("SELECT", b"column"),
+    ):
+        p = run([db2, bad])
+        check(p.returncode == 1 and needle in p.stderr,
+              "refusal: %s" % bad, "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+
+    # A WAL-mode database is a documented non-goal, but it must not be misread.
+    wal = os.path.join(WORK, "walmode.db")
+    for s in ("", "-wal", "-shm"):
+        if os.path.exists(wal + s):
+            os.remove(wal + s)
+    conn = sqlite3.connect(wal)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript("CREATE TABLE w(a); INSERT INTO w VALUES(1),(2),(3);")
+    conn.commit()
+    conn.close()
+    # After a clean close SQLite checkpoints, so the .db is complete and sqlr
+    # reads it fine. That is the honest claim: sqlr reads a checkpointed file.
+    p = run([wal, "SELECT * FROM w"])
+    check(p.returncode == 0 and p.stdout == b"1\n2\n3\n",
+          "checkpointed WAL-mode file reads correctly",
+          "rc=%d out=%r" % (p.returncode, p.stdout[:120]))
+
+
+# ------------------------------------------------------------- robustness
+# A file-format parser is fed untrusted bytes. Truncated and corrupted input
+# must produce an error, not a crash and not a hang.
+
+def readonly_check():
+    """sqlr must never modify a database file."""
+    import hashlib
+    src = os.path.join(WORK, "types.db")
+    with open(src, "rb") as f:
+        before = hashlib.sha256(f.read()).hexdigest()
+    mode_before = os.stat(src).st_mode
+    for c in ([".tables"], [".schema"], ["SELECT * FROM allt"]):
+        run([src] + c)
+    with open(src, "rb") as f:
+        after = hashlib.sha256(f.read()).hexdigest()
+    check(before == after and mode_before == os.stat(src).st_mode,
+          "database file is unchanged after reading it")
+    check(not any(os.path.exists(src + s) for s in ("-journal", "-wal", "-shm")),
+          "sqlr created no journal or WAL sidecar")
+
+
 def main():
     if not os.path.exists(SQLR):
         print("sqlr binary not found at %s; run make first" % SQLR, file=sys.stderr)
@@ -415,6 +556,8 @@ def main():
     print("%d databases, %d comparison cases" % (n, len(CASES)))
 
     compare_cases()
+    refusals()
+    readonly_check()
 
     if failures:
         print("\nFAILURES:")
