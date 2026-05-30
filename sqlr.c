@@ -551,9 +551,24 @@ static int parse_create(Table *t, const char *sql) {
 			if (!*p) return err("table %s: unterminated quote in CREATE", t->name);
 			continue;
 		}
-		if (*p == '(') depth++;
-		else if (*p == ')' && depth > 0) depth--;
-		if (*p == 0 || (depth == 0 && (*p == ',' || *p == ')'))) {
+		/* Decide whether this byte ends a column-def BEFORE touching depth: a
+		 * ')' that closes a nested group like VARCHAR(10,2) brings depth back
+		 * to zero but must not be mistaken for the end of the column list. The
+		 * first version got this wrong and the oracle caught it: SELECT * on a
+		 * table whose first column was VARCHAR(10,2) returned one column of
+		 * four, which is a wrong answer rather than an error. */
+		int split = 0, done = 0;
+		if (*p == 0) {
+			split = done = 1;
+		} else if (*p == '(') {
+			depth++;
+		} else if (*p == ')') {
+			if (depth > 0) depth--;
+			else split = done = 1;
+		} else if (*p == ',' && depth == 0) {
+			split = 1;
+		}
+		if (split) {
 			/* [part, p) is one column-def or table-constraint */
 			char *frag = dupn((const uint8_t *)part, (size_t)(p - part));
 			const char *q = frag;
@@ -620,7 +635,7 @@ static int parse_create(Table *t, const char *sql) {
 				}
 			}
 			free(frag);
-			if (*p == 0 || *p == ')') break;
+			if (done) break;
 			part = p + 1;
 		}
 	}
