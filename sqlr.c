@@ -74,12 +74,14 @@ static int varint(const uint8_t *p, const uint8_t *end, uint64_t *out) {
 }
 
 /* n-byte big-endian two's-complement integer, for serial types 1-6 (widths 1,
- * 2, 3, 4, 6, 8). The sign lives in the top bit of the first byte, so start
- * from a signed char and shift the rest in. */
+ * 2, 3, 4, 6, 8). Accumulate in unsigned and sign-extend from bit 8n-1 at the
+ * end: shifting a negative signed value left is undefined behaviour, and
+ * UBSan in `make test-asan` found exactly that in the first version of this. */
 static int64_t be_int(const uint8_t *p, int n) {
-	int64_t v = (int8_t)p[0];
-	for (int i = 1; i < n; i++) v = (v << 8) | p[i];
-	return v;
+	uint64_t u = 0;
+	for (int i = 0; i < n; i++) u = (u << 8) | p[i];
+	if (n < 8 && (u & ((uint64_t)1 << (n * 8 - 1)))) u |= ~(uint64_t)0 << (n * 8);
+	return (int64_t)u;
 }
 
 static double be_double(const uint8_t *p) {
