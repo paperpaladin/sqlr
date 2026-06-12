@@ -14,6 +14,7 @@ from SQLite's own hex(), so put_real() and put_blob() in sqlr.c are checked
 against SQLite's formatting rather than against a Python reimplementation.
 """
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -543,6 +544,111 @@ def refusals():
 # A file-format parser is fed untrusted bytes. Truncated and corrupted input
 # must produce an error, not a crash and not a hang.
 
+def truncation_sweep(src, cmds, psize, nspread):
+    """Cut a valid database short at many offsets. Every page boundary matters:
+    that is where a b-tree child pointer, an overflow link or a cell array stops
+    existing. The requirement is an error, never a crash and never a hang."""
+    size = os.path.getsize(src)
+    victim = os.path.join(WORK, "trunc.db")
+    with open(src, "rb") as f:
+        whole = f.read()
+    offsets = set(range(0, min(size, 130)))
+    for pg in range(0, size // psize + 2):
+        for d in (-1, 0, 1):
+            o = pg * psize + d
+            if 0 <= o <= size:
+                offsets.add(o)
+    step = max(1, size // nspread)
+    offsets.update(range(0, size, step))
+    offsets = sorted(offsets)[:1400]
+    bad = []
+    for off in offsets:
+        with open(victim, "wb") as f:
+            f.write(whole[:off])
+        for c in cmds:
+            p = run([victim] + c, timeout=30)
+            if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
+                bad.append("truncate %s@%d %s -> rc=%d %r"
+                           % (os.path.basename(src), off, c[0], p.returncode, p.stderr[:300]))
+    check(not bad,
+          "%s: %d truncation offsets x %d commands error cleanly"
+          % (os.path.basename(src), len(offsets), len(cmds)),
+          "\n    ".join(bad[:8]))
+    return whole, size
+
+
+def robustness():
+    # types.db: 4 KiB pages, every storage class, one b-tree level.
+    whole, size = truncation_sweep(
+        os.path.join(WORK, "types.db"),
+        [[".tables"], [".schema"], ["SELECT * FROM allt"],
+         ["SELECT i FROM allt WHERE i = 7"]], 4096, 120)
+    # ovlong.db: 512-byte pages and a 200 KB value, so most of the file is a
+    # single overflow chain and truncation always cuts it mid-link.
+    truncation_sweep(os.path.join(WORK, "ovlong.db"),
+                     [[".tables"], ["SELECT * FROM big"]], 512, 150)
+    # deep.db: a four-level b-tree, so truncation removes interior pages.
+    truncation_sweep(os.path.join(WORK, "deep.db"),
+                     [[".schema"], ["SELECT * FROM d"],
+                      ["SELECT id FROM d WHERE id = 50000"]], 512, 150)
+
+    src = os.path.join(WORK, "types.db")
+    victim = os.path.join(WORK, "trunc.db")
+    cmds = [[".dbinfo"], [".tables"], [".schema"], ["SELECT * FROM allt"],
+            ["SELECT i FROM allt WHERE i = 7"]]
+
+    # Single-byte corruption across the first few pages: page types, cell
+    # counts, cell pointers and record varints all live here, and a wrong value
+    # must not become a wild read or an endless loop.
+    rnd = random.Random(20261005)
+    bad = []
+    trials = 500
+    for _ in range(trials):
+        off = rnd.randrange(0, min(size, 16384))
+        b = bytearray(whole)
+        b[off] = rnd.randrange(256)
+        with open(victim, "wb") as f:
+            f.write(bytes(b))
+        c = rnd.choice(cmds)
+        p = run([victim] + c, timeout=30)
+        if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
+            bad.append("flip@%d %s -> rc=%d %r" % (off, c[0], p.returncode, p.stderr[:300]))
+    check(not bad, "%d single-byte corruptions error cleanly" % trials,
+          "\n    ".join(bad[:8]))
+
+    # Hand-built hostile files, including the cycles a visited-page bitmap has
+    # to catch: a b-tree root that is its own child, and a self-linked overflow
+    # page.
+    for name, blob in (
+        ("empty", b""),
+        ("short", b"SQLite format 3\x00"),
+        ("header-only", whole[:100]),
+        ("bad-magic", b"NotASQLiteFile!\x00" + whole[16:8192]),
+        ("zero-pagesize", whole[:16] + b"\x00\x00" + whole[18:8192]),
+        ("odd-pagesize", whole[:16] + b"\x00\x07" + whole[18:8192]),
+        ("utf16", whole[:56] + b"\x00\x00\x00\x02" + whole[60:8192]),
+        ("huge-pagecount", whole[:28] + b"\x7f\xff\xff\xff" + whole[32:8192]),
+        ("bad-fractions", whole[:21] + b"\x01\x01\x01" + whole[24:8192]),
+        ("all-zero-pages", whole[:100] + b"\x00" * (8192 - 100)),
+        ("interior-root-self-cycle",
+         whole[:100] + b"\x05\x00\x00\x00\x00\x0f\xf8\x00\x00\x00\x00\x01"
+         + whole[112:8192]),
+    ):
+        pth = os.path.join(WORK, "deg-%s.db" % name)
+        with open(pth, "wb") as f:
+            f.write(blob)
+        okall = True
+        for c in cmds:
+            p = run([pth] + c, timeout=30)
+            if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
+                okall = False
+                check(False, "degenerate %s" % name,
+                      "%s rc=%d %r" % (c[0], p.returncode, p.stderr[:300]))
+                break
+        if okall:
+            check(True, "degenerate %s errors cleanly" % name)
+
+
 def readonly_check():
     """sqlr must never modify a database file."""
     import hashlib
@@ -576,6 +682,8 @@ def main():
     compare_cases()
     refusals()
     readonly_check()
+    print("robustness: truncating and corrupting ...")
+    robustness()
 
     if failures:
         print("\nFAILURES:")
