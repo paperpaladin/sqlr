@@ -13,6 +13,8 @@ back into SQLite: REAL text comes from SQLite's own CAST(x AS TEXT) and blob hex
 from SQLite's own hex(), so put_real() and put_blob() in sqlr.c are checked
 against SQLite's formatting rather than against a Python reimplementation.
 """
+import ctypes
+import ctypes.util
 import os
 import random
 import shutil
@@ -152,12 +154,24 @@ def oracle_tables(db):
 
 
 def oracle_dbinfo(db):
-    """Every line of .dbinfo is a header field that SQLite also reports through
-    a PRAGMA, so the 100-byte header parse is checked field by field."""
+    """Six of the seven .dbinfo lines are header fields SQLite also reports
+    through a PRAGMA, so the 100-byte header parse is checked field by field.
+
+    reserved_bytes is the seventh and has no PRAGMA -- SQLite will set it
+    through sqlite3_file_control but never reads it back out, so the authority
+    here is the file format specification instead: it is the single byte at
+    offset 20. That is a second implementation of the same spec sentence
+    rather than a second opinion, which is weaker than a PRAGMA, so say which
+    one it is. It used to be a hardcoded 0, which every fixture also happened
+    to be; deleting sqlr's read of byte 20 altogether left the suite at
+    "114 agree, 0 disagree".
+    """
     conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
     try:
         def pr(name):
             return conn.execute("PRAGMA " + name).fetchone()[0]
+        with open(db, "rb") as fh:
+            reserved = fh.read(21)[20]
         return ("page_size\t%d\n"
                 "page_count\t%d\n"
                 "reserved_bytes\t%d\n"
@@ -165,7 +179,7 @@ def oracle_dbinfo(db):
                 "schema_cookie\t%d\n"
                 "user_version\t%d\n"
                 "freelist_pages\t%d\n"
-                % (pr("page_size"), pr("page_count"), 0, pr("encoding"),
+                % (pr("page_size"), pr("page_count"), reserved, pr("encoding"),
                    pr("schema_version"), pr("user_version"),
                    pr("freelist_count"))).encode()
     finally:
@@ -185,11 +199,45 @@ def oracle_schema(db):
 
 # ------------------------------------------------------------------- corpus
 
-def make(name, script, rows=(), page_size=None, extra=None):
+def seed_reserve_bytes(path, n):
+    """Create `path` as a database whose pages end with `n` reserved bytes.
+
+    Reserved bytes shrink the usable page below the page size, which moves
+    every overflow threshold and the end of the cell content area. There is no
+    PRAGMA that sets them and none that reads them back: the only interface is
+    sqlite3_file_control(SQLITE_FCNTL_RESERVE_BYTES), which Python's module
+    does not expose. So drive libsqlite3 through ctypes for this one step --
+    still SQLite doing the writing, which is the rule the corpus is built on.
+    The value lives in the header from here on, so the ordinary Python path
+    can carry on appending to the file afterwards.
+    """
+    lib = ctypes.CDLL(ctypes.util.find_library("sqlite3") or "libsqlite3.so.0")
+    db = ctypes.c_void_p()
+    if lib.sqlite3_open(path.encode(), ctypes.byref(db)) != 0:
+        raise RuntimeError("sqlite3_open failed for %s" % path)
+    try:
+        want = ctypes.c_int(n)
+        # SQLITE_FCNTL_RESERVE_BYTES == 38
+        if lib.sqlite3_file_control(db, None, 38, ctypes.byref(want)) != 0:
+            raise RuntimeError("SQLITE_FCNTL_RESERVE_BYTES refused")
+        # A page has to be written for the header to reach the file, and the
+        # VACUUM is what rewrites it with the new usable size.
+        lib.sqlite3_exec(db, b"CREATE TABLE seed(x); VACUUM;", None, None, None)
+    finally:
+        lib.sqlite3_close(db)
+    with open(path, "rb") as fh:
+        got = fh.read(21)[20]
+    if got != n:
+        raise RuntimeError("asked for %d reserved bytes, header says %d" % (n, got))
+
+
+def make(name, script, rows=(), page_size=None, extra=None, reserve_bytes=None):
     """Build a database with SQLite. SQLite is the only thing that ever writes."""
     path = os.path.join(WORK, name + ".db")
     if os.path.exists(path):
         os.remove(path)
+    if reserve_bytes:
+        seed_reserve_bytes(path, reserve_bytes)
     conn = sqlite3.connect(path)
     if page_size:
         conn.execute("PRAGMA page_size=%d" % page_size)
@@ -209,6 +257,41 @@ def make(name, script, rows=(), page_size=None, extra=None):
         if os.path.exists(j):
             os.remove(j)
     return path
+
+
+def check_btree_shape(db, table, levels, internal, leaf):
+    """Assert the shape of a fixture's b-tree, using SQLite's own dbstat view.
+
+    A fixture whose whole purpose is its shape has to have that shape
+    asserted, not described. README.md and PLAN.md both name this tree as "a
+    4-level b-tree, 3,266 leaf and 66 interior pages" and give that as the
+    reason the fixture exists -- an interior page whose children are also
+    interior pages. Nothing checked it. SQLite chooses the shape, so a change
+    in how it fills pages would quietly turn the fixture into a shallow tree
+    and the claim into fiction, with every test still passing.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        counts = dict(conn.execute(
+            "SELECT pagetype, count(*) FROM dbstat WHERE name = ? GROUP BY pagetype",
+            (table,)).fetchall())
+        # dbstat's path is '/' for the root and one '/NNN' per level below it,
+        # so the number of separators in the longest path is the depth.
+        depth = conn.execute(
+            "SELECT max(length(path) - length(replace(path, '/', '')))"
+            " FROM dbstat WHERE name = ?", (table,)).fetchone()[0]
+    except sqlite3.OperationalError as e:
+        check(False, "%s/%s b-tree shape" % (os.path.basename(db), table),
+              "dbstat unavailable in this SQLite build: %s" % e)
+        return
+    finally:
+        conn.close()
+    got = (depth, counts.get("internal", 0), counts.get("leaf", 0))
+    want = (levels, internal, leaf)
+    check(got == want,
+          "%s: %s is a %d-level b-tree, %d interior and %d leaf pages"
+          % (os.path.basename(db), table, levels, internal, leaf),
+          "dbstat says depth %d, %d interior, %d leaf" % got)
 
 
 CASES = []  # (dbpath, argv_tail, sql_for_oracle_or_None, kind)
@@ -370,6 +453,7 @@ def build_corpus():
     q(db, "SELECT s FROM d WHERE s = 'deep-row-033333-padding'")
     q(db, "SELECT id FROM d WHERE id > 49998")
     meta(db, ".dbinfo")
+    check_btree_shape(db, "d", levels=4, internal=66, leaf=3266)
 
     # 5. Non-contiguous rowids after deletes, plus an explicit rowid gap, so the
     #    scan cannot assume rowid == position.
@@ -468,6 +552,30 @@ def build_corpus():
     q(db, "SELECT * FROM af WHERE noaff = '5'")
     q(db, "SELECT * FROM af WHERE i > '5'")
 
+    # 11. Reserved bytes at the end of every page. This is the one header
+    #     field with no PRAGMA behind it, and every other fixture has it at
+    #     zero -- which is also what .dbinfo used to be compared against, so
+    #     the field was never really read. Reserved bytes are not just a
+    #     number to print: they shrink the usable page, which moves the end of
+    #     the cell content area and every overflow threshold. A parser that
+    #     reports the byte but computes thresholds from the full page size
+    #     gets the header line right and the rows wrong, so the fixture holds
+    #     a value long enough to overflow and a 512-byte page to overflow it
+    #     sooner.
+    db = make("reserve", """
+        CREATE TABLE r(k INTEGER PRIMARY KEY, short TEXT, long TEXT);
+    """, rows=[("INSERT INTO r VALUES(?,?,?)",
+                [(i, "s%d" % i, ("payload-%03d " % i) * 60) for i in range(40)])],
+         page_size=512, reserve_bytes=32)
+    meta(db, ".dbinfo")
+    meta(db, ".tables")
+    meta(db, ".schema")
+    q(db, "SELECT k, short FROM r")
+    q(db, "SELECT * FROM r")
+    q(db, "SELECT long FROM r WHERE k = 17")
+    q(db, "SELECT * FROM r WHERE k = 39")
+    q(db, "SELECT * FROM r WHERE k IS NOT NULL", json=True)
+
     return WORK
 
 
@@ -565,7 +673,28 @@ def truncation_sweep(src, cmds, psize, nspread):
                 offsets.add(o)
     step = max(1, size // nspread)
     offsets.update(range(0, size, step))
-    offsets = sorted(offsets)[:1400]
+
+    # Cap the work, but spread the cap over the whole file instead of taking
+    # the lowest offsets. `sorted(offsets)[:1400]` was a prefix: deep.db is
+    # 1.7 MB and generates 10,274 candidate offsets, so the cap kept only the
+    # first 13% of the file and ovlong.db the first 49%. Both fixtures exist
+    # for what lives past that line -- deep.db for the interior pages of a
+    # four-level b-tree, ovlong.db for the tail of a 200 KB overflow chain --
+    # so the two sweeps that most needed the depth were the two that never
+    # reached it. Keep every offset inside the 100-byte header and the page
+    # after it, then take an even sample of the rest.
+    CAP = 1400
+    offsets = sorted(offsets)
+    if len(offsets) > CAP:
+        head = [o for o in offsets if o < 130]
+        rest = [o for o in offsets if o >= 130]
+        room = max(1, CAP - len(head))
+        stride = max(1, len(rest) // room)
+        offsets = head + rest[::stride][:room]
+        # The last byte is a boundary of its own: a file cut to exactly its
+        # own length is the one truncation that must still read correctly.
+        if rest[-1] not in offsets:
+            offsets.append(rest[-1])
     bad = []
     for off in offsets:
         with open(victim, "wb") as f:

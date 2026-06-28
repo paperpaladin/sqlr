@@ -6,3 +6,5 @@ t/work*
 *.db-journal
 *.db-wal
 *.db-shm
+__pycache__/
+*.pyc
