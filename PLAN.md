@@ -172,7 +172,7 @@ LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
            is the one failure mode that is silent, not loud
 - [ ] 10 a real expression evaluator: tokenise once, build a tree, support
       AND/OR/NOT, parentheses, `LIKE`, `IN`, arithmetic, and `COLLATE NOCASE`
-      why: `WHERE` is one term today, which is the limit people hit first; the
+      why: `WHERE` is one term today, the limit people hit first; the
            scan loop already calls a predicate once per row, so the shape is right
 - [ ] 11 `ORDER BY` and `LIMIT`, by buffering and sorting the selected rows
       why: without them the 50,000-row cases can only be compared in full
