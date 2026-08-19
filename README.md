@@ -1,6 +1,6 @@
 # sqlr
 
-A read-only SQLite 3 database file parser in one C file: it reads the on-disk
+A read-only SQLite 3 database file parser in one C file. It reads the on-disk
 format directly, header, b-tree pages, overflow chains, records, `sqlite_schema`,
 and answers `SELECT ... FROM table [WHERE col = value]` by full table scan,
 without linking libsqlite3.
@@ -98,7 +98,7 @@ once by SQLite and once by `sqlr`, and the two byte strings must be equal.
 `t/run.sh` prints `N agree, M disagree` and exits nonzero if anything disagrees.
 
 The harness pushes every formatting decision back into SQLite,
-not reimplementing it, so the comparison stays a real test: a REAL's text comes from
+not reimplementing it, so the comparison stays a real test. A REAL's text comes from
 SQLite's own `CAST(x AS TEXT)` and a BLOB's hex from SQLite's own `hex()`. If
 `put_real()` in `sqlr.c` renders `1.0` as `1`, the oracle says so, and it did.
 

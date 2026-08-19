@@ -83,7 +83,7 @@ Ranked, strongest first.
 ## Non-goals
 
 Writing, in any form. Indexes, every query is a full table scan, and an index
-b-tree page is refused, not misread. WAL replay: a `-wal` file is ignored,
+b-tree page is refused, not misread. WAL replay. A `-wal` file is ignored,
 so an un-checkpointed database reads as its last checkpoint. `WITHOUT ROWID`
 tables, which are index b-trees. UTF-16 databases. Joins, aggregates, ORDER BY,
 LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
