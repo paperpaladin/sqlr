@@ -106,8 +106,7 @@ One honest deviation from the brief: the `sqlite3` command-line shell is not
 installed in this environment (`sqlite3: command not found`. No package may be
 installed). SQLite is therefore reached through python3's stdlib `sqlite3`
 module, a binding to the same libsqlite3, version 3.46.1. The engine
-and the authority are identical; only the front end differs. The practical cost
-is that output formats cannot be inherited from the shell's `.mode tabs` and
+and the authority are identical; only the front end differs. In practice the cost is that output formats cannot be inherited from the shell's `.mode tabs` and
 `.mode json`, so `sqlr` defines them (see PLAN.md, "Contract") and the harness
 computes the expected bytes from SQLite's values.
 
