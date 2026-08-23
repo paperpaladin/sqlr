@@ -8,7 +8,7 @@ compared byte for byte. Any difference is a disagreement and fails the run.
 The sqlite3 command-line shell is not installed in this environment, so the
 authority is reached through python3's stdlib binding to the same libsqlite3
 (see README, "The oracle"). It is the same engine; only the front end differs.
-Crucially, every rendering decision that could paper over a sqlr bug is pushed
+Every rendering decision that could paper over a sqlr bug is pushed
 back into SQLite: REAL text comes from SQLite's own CAST(x AS TEXT) and blob hex
 from SQLite's own hex(), so put_real() and put_blob() in sqlr.c are checked
 against SQLite's formatting rather than against a Python reimplementation.
