@@ -267,7 +267,8 @@ typedef struct {
 	Db *db;
 	uint8_t *rec;
 	size_t reccap;
-	uint8_t *seen;
+	uint8_t *seen;    /* pages visited by the b-tree walk */
+	uint8_t *ovfseen; /* pages visited by the current overflow chain */
 	size_t seenbytes;
 } Scan;
 
@@ -277,37 +278,55 @@ static void scan_init(Scan *s, Db *db) {
 	s->reccap = 0;
 	s->seenbytes = db->npages / 8 + 1;
 	s->seen = xmalloc(s->seenbytes);
+	/* Two bitmaps, not one. An overflow chain is followed in the middle of a
+	 * b-tree walk, so sharing the bitmap meant reading one long value wiped
+	 * the record of every page the walk had already visited and the cycle
+	 * check stopped working for the rest of the page. Found by reading, and
+	 * now reachable: an index cell carries a key, so an index interior page
+	 * reads overflow chains between descending into its children. */
+	s->ovfseen = xmalloc(s->seenbytes);
 }
 
 static void scan_free(Scan *s) {
 	free(s->rec);
 	free(s->seen);
+	free(s->ovfseen);
 }
 
-static void seen_clear(Scan *s) { memset(s->seen, 0, s->seenbytes); }
-
-static int seen_mark(Scan *s, uint32_t pg) {
+static int bit_mark(uint8_t *bm, size_t nbytes, uint32_t pg) {
 	size_t byte = pg / 8;
 	uint8_t bit = (uint8_t)(1u << (pg % 8));
-	if (byte >= s->seenbytes) return 0;
-	if (s->seen[byte] & bit) return 1; /* already visited: a cycle */
-	s->seen[byte] |= bit;
+	if (byte >= nbytes) return 0;
+	if (bm[byte] & bit) return 1; /* already visited: a cycle */
+	bm[byte] |= bit;
 	return 0;
 }
 
+/* Exactly `need` bytes, never a rounded-up or a kept-around larger buffer.
+ * A buffer bigger than its data turns the sanitizer off: a read one byte past
+ * a 310-byte payload sitting in a 512-byte allocation lands inside live
+ * memory and ASan says nothing. Measured here rather than assumed -- a
+ * deliberate one-past-the-end read of an assembled payload is silent with the
+ * rounded-up buffer this replaced, and reported with this one. Index payloads
+ * are what made it worth fixing: an index page spills at about a fifth of the
+ * length a table leaf does, so almost every long key goes through here. */
 static uint8_t *rec_room(Scan *s, size_t need) {
-	if (need > s->reccap) {
-		s->reccap = need < 512 ? 512 : need;
+	if (need != s->reccap) {
 		free(s->rec);
-		s->rec = xmalloc(s->reccap);
+		s->rec = xmalloc(need ? need : 1);
+		s->reccap = need;
 	}
 	return s->rec;
 }
 
-/* How much of a leaf cell's payload lives on the leaf page itself.
+/* How much of a cell's payload lives on the cell's own page.
  *
- * X is the largest payload a leaf cell may hold without spilling: the usable
- * size minus 35, the worst-case cell overhead. If the payload is bigger,
+ * X is the largest payload a cell may hold without spilling. On a table leaf
+ * it is the usable size minus 35, the worst-case cell overhead; on an index
+ * page, leaf or interior, it is instead 64/255ths of the usable space minus
+ * the same 23-byte allowance M uses, which is far smaller -- an index key of
+ * a couple of hundred bytes already overflows on a 512-byte page where a
+ * table row of the same size does not. If the payload is bigger,
  * SQLite does NOT simply store X bytes locally. It stores either M bytes or
  * K bytes, chosen so the final overflow page is as full as possible while the
  * local part stays >= M. M is the minimum local payload, 32/255ths of the
@@ -316,8 +335,8 @@ static uint8_t *rec_room(Scan *s, size_t need) {
  * carries usable-4 bytes, the 4 being the next-page pointer). If that K still
  * fits on the page, use it; otherwise fall back to M. Getting this wrong
  * silently misreads every long value in the database, so it is spelled out. */
-static uint32_t local_payload(uint32_t usable, uint64_t p) {
-	uint32_t x = usable - 35;
+static uint32_t local_payload(uint32_t usable, uint64_t p, int is_index) {
+	uint32_t x = is_index ? ((usable - 12) * 64 / 255) - 23 : usable - 35;
 	if (p <= x) return (uint32_t)p;
 	uint32_t m = ((usable - 12) * 32 / 255) - 23;
 	uint32_t k = m + (uint32_t)((p - m) % (usable - 4));
@@ -327,9 +346,9 @@ static uint32_t local_payload(uint32_t usable, uint64_t p) {
 /* Copy a cell's full payload (local part plus the overflow chain) into the
  * scan's record buffer. */
 static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
-                        size_t page_room, const uint8_t **out) {
+                        size_t page_room, int is_index, const uint8_t **out) {
 	Db *db = s->db;
-	uint32_t local = local_payload(db->usable, plen);
+	uint32_t local = local_payload(db->usable, plen, is_index);
 
 	/* A payload cannot be larger than the bytes the file actually contains;
 	 * checking that first turns a corrupt length into an error instead of a
@@ -351,10 +370,11 @@ static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
 
 	/* The 4 bytes after the local payload are the first overflow page number;
 	 * each overflow page is 4 bytes of "next page, or 0" then raw payload. */
-	seen_clear(s);
+	memset(s->ovfseen, 0, s->seenbytes);
 	while (got < plen) {
 		if (next == 0) return err("overflow chain ended %zu bytes early", (size_t)plen - got);
-		if (seen_mark(s, next)) return err("overflow chain loops back to page %u", next);
+		if (bit_mark(s->ovfseen, s->seenbytes, next))
+			return err("overflow chain loops back to page %u", next);
 		const uint8_t *op = page_at(db, next);
 		if (!op) return -1;
 		size_t chunk = db->usable - 4;
@@ -371,15 +391,26 @@ static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
 
 typedef int (*RowFn)(void *ctx, int64_t rowid, const uint8_t *payload, size_t plen);
 
-/* shortcut: table b-trees only (page types 5 and 13). Index b-trees (2 and 10)
- * are recognised and refused; nothing here needs them because every query is a
- * full table scan. Upgrade path: index leaf cells are the same record format
- * with the rowid as the trailing column, so adding them is a new cell decoder
- * plus a seek, not a redesign. */
-static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
+/* One walker serves both kinds of b-tree. They differ in exactly three places:
+ * the page type bytes, whether an interior cell carries a key as well as a
+ * child pointer, and the local-payload threshold.
+ *
+ * The traversal order is the key order. On an index interior page a cell's
+ * own key sorts AFTER everything in that cell's left child, so the child is
+ * descended first and the key emitted afterwards; the right-most child, which
+ * hangs off the page header rather than the cell array, comes last. A table
+ * interior cell has a rowid but no payload, so there is nothing to emit in
+ * between and only the order of the descents matters.
+ *
+ * shortcut: an index on a WITHOUT ROWID table ends each entry with the
+ * table's primary key instead of a rowid, and nothing here knows that. Those
+ * tables are refused in parse_create, which is what keeps this honest; the
+ * upgrade path is PLAN item 08. */
+static int walk(Scan *s, uint32_t pgno, int depth, int want_index, RowFn fn, void *ctx) {
 	Db *db = s->db;
 	if (depth > 40) return err("b-tree deeper than 40 levels; refusing to recurse");
-	if (seen_mark(s, pgno)) return err("b-tree revisits page %u (corrupt)", pgno);
+	if (bit_mark(s->seen, s->seenbytes, pgno))
+		return err("b-tree revisits page %u (corrupt)", pgno);
 
 	const uint8_t *pg = page_at(db, pgno);
 	if (!pg) return -1;
@@ -388,13 +419,17 @@ static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
 	uint32_t off = (pgno == 1) ? 100 : 0;
 	const uint8_t *h = pg + off;
 	uint8_t type = h[0];
-	if (type != 5 && type != 13) {
-		if (type == 2 || type == 10)
-			return err("page %u is an index b-tree page; sqlr reads table b-trees only", pgno);
+	if (type != 2 && type != 5 && type != 10 && type != 13)
 		return err("page %u has unknown b-tree page type %u", pgno, type);
-	}
+	int is_index = (type == 2 || type == 10);
+	int interior = (type == 2 || type == 5);
+	/* A root page of the wrong kind means the schema and the file disagree,
+	 * which is corruption, not something to decode on a guess. */
+	if (is_index != want_index)
+		return err("page %u is %s b-tree page but %s b-tree was expected", pgno,
+		           is_index ? "an index" : "a table", want_index ? "an index" : "a table");
 	uint32_t ncell = be16(h + 3);
-	uint32_t hsize = (type == 5) ? 12 : 8;
+	uint32_t hsize = interior ? 12 : 8;
 	uint32_t cellptr = off + hsize;
 	if (cellptr + 2 * ncell > db->usable)
 		return err("page %u claims %u cells, which overruns the page", pgno, ncell);
@@ -406,37 +441,44 @@ static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
 		const uint8_t *c = pg + co;
 		const uint8_t *cend = pg + db->usable;
 
-		if (type == 5) {
-			/* Interior table cell: 4-byte left child page number, then a
-			 * varint rowid we do not need for a full scan. */
+		if (interior) {
+			/* Both interior cell formats start with the 4-byte left child. */
 			if (cend - c < 4) return err("page %u cell %u truncated", pgno, i);
-			if (walk(s, be32(c), depth + 1, fn, ctx) < 0) return -1;
-		} else {
-			/* Leaf table cell: varint total payload length, varint rowid,
-			 * then the payload. */
-			uint64_t plen, rowid;
-			int k = varint(c, cend, &plen);
-			if (k < 0) return err("page %u cell %u: bad payload length varint", pgno, i);
-			c += k;
+			if (walk(s, be32(c), depth + 1, want_index, fn, ctx) < 0) return -1;
+			if (!is_index) continue; /* table interior: the rowid is not needed */
+			c += 4;
+		}
+		/* A leaf cell, or the key half of an index interior cell: varint
+		 * payload length, then (table only) a varint rowid, then the payload. */
+		uint64_t plen, rowid = 0;
+		int k = varint(c, cend, &plen);
+		if (k < 0) return err("page %u cell %u: bad payload length varint", pgno, i);
+		c += k;
+		if (!is_index) {
 			k = varint(c, cend, &rowid);
 			if (k < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
 			c += k;
-			const uint8_t *pay;
-			if (payload_read(s, c, plen, (size_t)(cend - c), &pay) < 0) return -1;
-			if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
 		}
+		const uint8_t *pay;
+		if (payload_read(s, c, plen, (size_t)(cend - c), is_index, &pay) < 0) return -1;
+		if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
 	}
-	if (type == 5) {
+	if (interior) {
 		/* The right-most child hangs off the page header, not the cell array;
-		 * visiting it last is what keeps a scan in rowid order. */
-		if (walk(s, be32(h + 8), depth + 1, fn, ctx) < 0) return -1;
+		 * visiting it last is what keeps a scan in key order. */
+		if (walk(s, be32(h + 8), depth + 1, want_index, fn, ctx) < 0) return -1;
 	}
 	return 0;
 }
 
 static int scan_table(Scan *s, uint32_t root, RowFn fn, void *ctx) {
-	seen_clear(s);
-	return walk(s, root, 0, fn, ctx);
+	memset(s->seen, 0, s->seenbytes);
+	return walk(s, root, 0, 0, fn, ctx);
+}
+
+static int scan_index(Scan *s, uint32_t root, RowFn fn, void *ctx) {
+	memset(s->seen, 0, s->seenbytes);
+	return walk(s, root, 0, 1, fn, ctx);
 }
 
 /* ------------------------------------------------------- string helpers */
@@ -491,9 +533,21 @@ typedef struct {
 	int ipk; /* index of the INTEGER PRIMARY KEY column, or -1 */
 } Table;
 
+/* An index as sqlite_schema records it. `sql` is NULL for the indexes SQLite
+ * creates for itself (sqlite_autoindex_*, one per UNIQUE or PRIMARY KEY
+ * constraint), which is why it is kept separately from the name. */
+typedef struct {
+	char *name;
+	char *tbl;
+	char *sql;
+	uint32_t root;
+} Idx;
+
 typedef struct {
 	Table *t;
 	int n, cap;
+	Idx *ix;
+	int nix, ixcap;
 	char **sql; /* every schema row's SQL text, in sqlite_schema order, for .schema */
 	int nsql, sqlcap;
 } Schema;
@@ -670,10 +724,26 @@ static int schema_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen)
 		}
 		sc->sql[sc->nsql++] = dupn(v[4].s, v[4].n);
 	}
-	if (v[0].t != V_TEXT || v[0].n != 5 || memcmp(v[0].s, "table", 5) != 0) return 0;
+	int is_table = (v[0].t == V_TEXT && v[0].n == 5 && memcmp(v[0].s, "table", 5) == 0);
+	int is_index = (v[0].t == V_TEXT && v[0].n == 5 && memcmp(v[0].s, "index", 5) == 0);
+	if (!is_table && !is_index) return 0; /* a view or a trigger: no b-tree */
 	if (v[1].t != V_TEXT) return err("sqlite_schema row has a non-text name");
 	if (v[3].t != V_INT) return err("sqlite_schema row has a non-integer rootpage");
 	if (v[3].i <= 0) return 0; /* virtual table: no b-tree of its own */
+
+	if (is_index) {
+		if (sc->nix == sc->ixcap) {
+			sc->ixcap = sc->ixcap ? sc->ixcap * 2 : 16;
+			sc->ix = realloc(sc->ix, (size_t)sc->ixcap * sizeof *sc->ix);
+			if (!sc->ix) exit(1);
+		}
+		Idx *x = &sc->ix[sc->nix++];
+		x->name = dupn(v[1].s, v[1].n);
+		x->tbl = (v[2].t == V_TEXT) ? dupn(v[2].s, v[2].n) : NULL;
+		x->sql = (v[4].t == V_TEXT) ? dupn(v[4].s, v[4].n) : NULL;
+		x->root = (uint32_t)v[3].i;
+		return 0;
+	}
 
 	if (sc->n == sc->cap) {
 		sc->cap = sc->cap ? sc->cap * 2 : 16;
@@ -910,6 +980,109 @@ static int col_index(Table *t, const char *name) {
 	if (ci_eq(name, "rowid") || ci_eq(name, "_rowid_") || ci_eq(name, "oid")) return -1;
 	return -2;
 }
+
+/* ----------------------------------------------------------------- indexes */
+
+/* An index entry is an ordinary record: the indexed columns in index order,
+ * then the rowid of the table row it points at. Nothing in the record says
+ * which column is which, so the affinities have to come from the CREATE INDEX
+ * statement mapped onto the table's columns. They are needed because a
+ * REAL-affinity column stores an integral value as an integer serial type in
+ * the index exactly as it does in the table, and printing it back as an
+ * integer is a wrong answer, not a formatting difference.
+ *
+ * shortcut: the column list is shape-matched, as in parse_create. An index on
+ * an expression, and an index SQLite wrote for itself (sqlite_autoindex_*,
+ * whose sqlite_schema row has no SQL at all), both come out with no affinity,
+ * which is only observable on a REAL column. Upgrade path is a real
+ * tokeniser, plus reading the UNIQUE constraints out of the CREATE TABLE to
+ * recover the key columns of an auto-index. */
+static int index_affinities(Schema *sc, Idx *x, Aff *aff, int *naff) {
+	*naff = 0;
+	if (!x->tbl) return 0;
+	Table *t = table_find(sc, x->tbl);
+	if (!t || !t->sql) return 0;
+	/* parse_create is also what refuses a WITHOUT ROWID table. Its indexes
+	 * end each entry with the table's primary key columns instead of a
+	 * rowid, so dumping one would print something plausible and wrong. The
+	 * refusal has to happen here rather than inside the column-list parse
+	 * below, because an auto-index has no CREATE statement to parse. */
+	if (t->ncol == 0 && parse_create(t, t->sql) < 0) return -1;
+	if (!x->sql) return 0;
+
+	const char *p = strchr(x->sql, '(');
+	if (!p) return 0;
+	p++;
+	int depth = 0;
+	const char *part = p;
+	for (;; p++) {
+		if (*p == '\'' || *p == '"' || *p == '`') {
+			char qc = *p++;
+			while (*p && *p != qc) p++;
+			if (!*p) return err("index %s: unterminated quote in CREATE", x->name);
+			continue;
+		}
+		int split = 0, done = 0;
+		if (*p == 0) {
+			split = done = 1;
+		} else if (*p == '(') {
+			depth++;
+		} else if (*p == ')') {
+			if (depth > 0) depth--;
+			else split = done = 1;
+		} else if (*p == ',' && depth == 0) {
+			split = 1;
+		}
+		if (split) {
+			char *frag = dupn((const uint8_t *)part, (size_t)(p - part));
+			const char *f = frag;
+			char *nm = ident(&f);
+			Aff a = AFF_BLOB; /* no affinity: leaves the stored value alone */
+			if (nm) {
+				int ci = col_index(t, nm);
+				if (ci >= 0) a = t->aff[ci];
+				free(nm);
+			}
+			if (*naff < MAXCOL) aff[(*naff)++] = a;
+			free(frag);
+			if (done) break;
+			part = p + 1;
+		}
+	}
+	return 0;
+}
+
+typedef struct {
+	FILE *out;
+	Aff aff[MAXCOL];
+	int naff;
+} IdxEmit;
+
+static int index_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
+	IdxEmit *e = ctx;
+	Val v[MAXCOL];
+	int n;
+	(void)rowid; /* an index entry carries its rowid inside the record */
+	if (rec_parse(pay, plen, v, &n) < 0) return -1;
+	for (int i = 0; i < n; i++) {
+		if (i) fputc('\t', e->out);
+		if (i < e->naff && e->aff[i] == AFF_REAL && v[i].t == V_INT) {
+			v[i].t = V_REAL;
+			v[i].r = (double)v[i].i;
+		}
+		put_tsv(e->out, &v[i]);
+	}
+	fputc('\n', e->out);
+	return 0;
+}
+
+static Idx *index_find(Schema *sc, const char *name) {
+	for (int i = 0; i < sc->nix; i++)
+		if (ci_eq(sc->ix[i].name, name)) return &sc->ix[i];
+	return NULL;
+}
+
+/* ------------------------------------------------------------- query parsing */
 
 /* shortcut: this recognises exactly
  *   SELECT <*|col,...> FROM <table> [WHERE <col> <op> <literal> | <col> IS [NOT] NULL]
@@ -1170,7 +1343,8 @@ static int cmp_name(const void *a, const void *b) {
 }
 
 static int usage(void) {
-	fputs("usage: sqlr [--json] DB.sqlite {.dbinfo | .tables | .schema | SELECT ...}\n", stderr);
+	fputs("usage: sqlr [--json] DB.sqlite "
+	      "{.dbinfo | .tables | .schema | .indexes | .index NAME | SELECT ...}\n", stderr);
 	return 2;
 }
 
@@ -1181,7 +1355,10 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--tsv")) json = 0;
 		else return usage();
 	}
-	if (argc - i != 2) return usage();
+	/* `.index NAME` is the one form that takes an argument of its own. */
+	const char *ixname = NULL;
+	if (argc - i == 3 && !strcmp(argv[i + 1], ".index")) ixname = argv[i + 2];
+	else if (argc - i != 2) return usage();
 	const char *path = argv[i], *cmd = argv[i + 1];
 
 	Db db;
@@ -1222,6 +1399,31 @@ int main(int argc, char **argv) {
 		qsort(names, (size_t)k, sizeof *names, cmp_name);
 		for (int j = 0; j < k; j++) printf("%s\n", names[j]);
 		free(names);
+	} else if (!strcmp(cmd, ".indexes")) {
+		/* Every index in sqlite_schema, sorted. The auto-indexes SQLite
+		 * creates for UNIQUE and PRIMARY KEY constraints are included: they
+		 * are real b-trees in the file and .index dumps them like any other. */
+		char **names = xmalloc((size_t)(schema.nix ? schema.nix : 1) * sizeof *names);
+		for (int j = 0; j < schema.nix; j++) names[j] = schema.ix[j].name;
+		qsort(names, (size_t)schema.nix, sizeof *names, cmp_name);
+		for (int j = 0; j < schema.nix; j++) printf("%s\n", names[j]);
+		free(names);
+	} else if (ixname) {
+		/* The index b-tree in key order, one entry per line: the indexed
+		 * columns, then the rowid the entry points at. */
+		Idx *x = index_find(&schema, ixname);
+		if (!x) {
+			fprintf(stderr, "sqlr: no such index: %s\n", ixname);
+			rc = 1;
+		} else {
+			IdxEmit e;
+			e.out = stdout;
+			if (index_affinities(&schema, x, e.aff, &e.naff) < 0 ||
+			    scan_index(&sc, x->root, index_row, &e) < 0) {
+				fprintf(stderr, "sqlr: %s\n", g_err);
+				rc = 1;
+			}
+		}
 	} else if (!strcmp(cmd, ".schema")) {
 		/* In sqlite_schema order, each statement terminated with a semicolon,
 		 * which is what sqlite3's .schema emits. */
