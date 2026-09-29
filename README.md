@@ -109,8 +109,9 @@ wrong:
   SQLite shrinks a float whose value is an exact integer and re-floats it on
   read. Nothing in the record says the value was ever a float.
 
-Four of those were found or confirmed by the oracle disagreeing, not by reading
-the spec more carefully.
+Three of those were found or confirmed by the oracle disagreeing, not by reading
+the spec more carefully. The two index rules were not: they came from the spec,
+and the oracle's part was to show they had been read correctly.
 
 ## The oracle
 
