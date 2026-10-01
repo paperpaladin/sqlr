@@ -33,18 +33,42 @@ SQLR = os.environ.get("SQLR", os.path.join(ROOT, "sqlr"))
 # fixed scratch paths reported failures they do not have.
 WORK = os.path.join(HERE, "work.%d" % os.getpid())
 
-agree = 0
-disagree = 0
+# Checks are counted by what the authority is, not all into one number. The
+# run used to print "171 agree, 0 disagree", and 28 of those 171 were not
+# agreements with anything: they were sqlr refusing a query, erroring cleanly
+# on a corrupt file, or leaving a file unmodified. Adding another "correctly
+# declines this" assertion made the agreement figure go up, which is the
+# wrong direction for a number whose name says SQLite agreed.
+#
+#   sqlite   SQLite answered the same question and the bytes matched: a query,
+#            a PRAGMA, dbstat, EXPLAIN QUERY PLAN.
+#   self     no outside authority. sqlr's two access paths against each other,
+#            sqlr's own choice of path, and a fixture's bytes read against the
+#            format specification.
+#   refusal  sqlr must decline loudly: exit 1 and say why.
+#   robust   sqlr must not misbehave on truncated, corrupt or hostile input,
+#            and must not write. The claim is not "matches SQLite", because
+#            SQLite's behaviour on a corrupt file is not a specification.
+KINDS = ("sqlite", "self", "refusal", "robust")
+KIND_WHAT = {
+    "sqlite": "agree with SQLite",
+    "self": "checks with no outside authority (the two access paths, fixture bytes)",
+    "refusal": "refusals, each loud and with a reason",
+    "robust": "hostile inputs that error cleanly, and the read-only checks",
+}
+passed = dict.fromkeys(KINDS, 0)
+failed = dict.fromkeys(KINDS, 0)
 failures = []
+notes = []
 
 
-def check(ok, what, detail=""):
-    global agree, disagree
+def check(ok, what, detail="", kind="sqlite"):
+    assert kind in KINDS, kind
     if ok:
-        agree += 1
+        passed[kind] += 1
     else:
-        disagree += 1
-        failures.append(what + (("\n    " + detail) if detail else ""))
+        failed[kind] += 1
+        failures.append("[%s] " % kind + what + (("\n    " + detail) if detail else ""))
 
 
 def run(args, **kw):
@@ -679,6 +703,30 @@ def build_corpus():
     idx(db, "sqlite_autoindex_u_1",
         "SELECT k, rowid FROM u INDEXED BY sqlite_autoindex_u_1")
 
+    # 8d. Indexes a seek has to decline, one per reason, each of them sitting
+    #     on exactly the column an equality WHERE names. Using any of them
+    #     would give the wrong rows or the right rows in the wrong order, so
+    #     the query falls back to the scan -- and a decline is a different
+    #     failure from a wrong answer, which is why the harness counts them
+    #     apart. 512-byte pages and 1,500 rows so that every one of these
+    #     indexes is more than a single page, i.e. a seek really would have
+    #     saved something. p_e is here so the fixture is not all declines.
+    db = make("noseek", """
+        CREATE TABLE p(a TEXT, b TEXT, c REAL, d TEXT, e INTEGER);
+    """, rows=[("INSERT INTO p(a,b,c,d,e) VALUES(?,?,?,?,?)",
+                [("a%03d" % (i % 200), "B%03d" % (i % 200), float(i % 50),
+                  "d%d" % (i % 4), i) for i in range(1500)])],
+         extra="""
+        CREATE INDEX p_nocase ON p(a COLLATE NOCASE);
+        CREATE INDEX p_desc ON p(b DESC);
+        CREATE INDEX p_expr ON p(abs(c));
+        CREATE INDEX p_part ON p(d) WHERE c > 5;
+        CREATE INDEX p_e ON p(e);
+    """, page_size=512)
+    meta(db, ".indexes")
+    for name in ("p_nocase", "p_desc", "p_expr", "p_part", "p_e"):
+        check_index_pages(db, name)
+
     # 9. Identifiers and declared types that stress the CREATE-statement
     #    shape-matcher: quoted names, a comma inside a type, table constraints
     #    that are not columns, DEFAULT values containing parentheses.
@@ -743,9 +791,44 @@ def build_corpus():
 
 # --------------------------------------------------------------- comparison
 
+def plan_of(stderr):
+    """The access path sqlr reported under --plan, as a tag, and the pages it
+    touched. `plan: scan t` -> "scan"; `plan: search t using rowid (rowid=?)`
+    -> "rowid"; `plan: search t using index i_name (name=?)` -> "index:i_name".
+    """
+    tag, pages = None, None
+    for line in stderr.decode("utf-8", "replace").splitlines():
+        if line.startswith("plan: "):
+            w = line[6:].split()
+            if w[0] == "scan":
+                tag = "scan"
+            elif w[3] == "rowid":
+                tag = "rowid"
+            else:
+                tag = "index:" + w[4]
+        elif line.startswith("pages: "):
+            pages = int(line[7:])
+    return tag, pages
+
+
+# How the 113 comparison cases were answered, tallied by access path. A row
+# comparison passes whichever path ran, so a suite where everything fell back
+# to the scan would look exactly like this one and test nothing about indexes.
+paths = {}
+
+
 def compare_cases():
     for db, argv, sql, kind in CASES:
-        p = run(argv)
+        # --plan goes on every SELECT: stdout is unaffected, and the tally of
+        # which path answered each case is then taken from the comparisons
+        # that are already byte-exact against SQLite rather than from a
+        # separate set of runs that might not be wired up the same way.
+        if kind in ("tsv", "json"):
+            p = run(["--plan"] + argv)
+            tag = plan_of(p.stderr)[0]
+            paths[tag] = paths.get(tag, 0) + 1
+        else:
+            p = run(argv)
         if kind == ".tables":
             want = oracle_tables(db)
         elif kind == ".dbinfo":
@@ -788,7 +871,7 @@ def refusals():
     p = run([db, "SELECT * FROM w"])
     check(p.returncode == 1 and b"WITHOUT ROWID" in p.stderr,
           "WITHOUT ROWID table is refused loudly",
-          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]), kind="refusal")
 
     # An index on a WITHOUT ROWID table is a readable b-tree whose entries end
     # with the table's primary key instead of a rowid. Dumping one would print
@@ -799,16 +882,16 @@ def refusals():
         p = run([db, ".index", which])
         check(p.returncode == 1 and b"WITHOUT ROWID" in p.stderr,
               "index %s on a WITHOUT ROWID table is refused loudly" % which,
-              "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+              "rc=%d err=%r" % (p.returncode, p.stderr[:200]), kind="refusal")
 
     p = run([db, ".index", "nosuchindex"])
     check(p.returncode == 1 and b"no such index" in p.stderr,
           "refusal: .index on a name that is not an index",
-          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]), kind="refusal")
     p = run([db, ".index", "w"])
     check(p.returncode == 1 and b"no such index" in p.stderr,
           "refusal: .index on a table name",
-          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]), kind="refusal")
 
     db2 = CASES[0][0]
     for bad, needle in (
@@ -821,7 +904,8 @@ def refusals():
     ):
         p = run([db2, bad])
         check(p.returncode == 1 and needle in p.stderr,
-              "refusal: %s" % bad, "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+              "refusal: %s" % bad, "rc=%d err=%r" % (p.returncode, p.stderr[:200]),
+              kind="refusal")
 
     # A WAL-mode database is a documented non-goal, but it must not be misread.
     wal = os.path.join(WORK, "walmode.db")
@@ -836,10 +920,240 @@ def refusals():
     # After a clean close SQLite checkpoints, so the .db is complete and sqlr
     # reads it fine. That is the honest claim: sqlr reads a checkpointed file.
     p = run([wal, "SELECT * FROM w"])
-    check(p.returncode == 0 and p.stdout == b"1\n2\n3\n",
+    want = oracle_query(wal, "SELECT * FROM w", False)
+    check(p.returncode == 0 and p.stdout == want,
           "checkpointed WAL-mode file reads correctly",
-          "rc=%d out=%r" % (p.returncode, p.stdout[:120]))
+          "rc=%d out=%r want=%r" % (p.returncode, p.stdout[:120], want[:120]))
 
+
+# ------------------------------------------------- the index against the scan
+# An equality WHERE can now be answered by descending an index instead of
+# reading every row. That is checkable twice over, and the two halves find
+# different bugs, so they are counted apart:
+#
+#   the index path must return exactly what the scan path returns, byte for
+#   byte. No outside authority is involved; sqlr is being compared against
+#   itself, and a seek that prunes a subtree it should have entered fails here
+#   without SQLite being consulted at all.
+#
+#   both must return what SQLite returns. A seek and a scan that agree with
+#   each other and not with SQLite is a different bug from a seek that
+#   disagrees with its own scan, and only this half can see it.
+#
+# EXPLAIN QUERY PLAN is the second half of the oracle for the decision rather
+# than the rows: it says whether SQLite chose an index for the same query.
+# Where sqlr declines an index SQLite uses, the rows still have to agree and
+# the difference is recorded as a finding, not a failure -- a declined index
+# is a slow answer, a wrongly used one is a wrong answer.
+
+def sqlite_plan(db, sql):
+    """How SQLite says it will answer `sql`, as the same tag sqlr prints."""
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        rows = [r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql)]
+    finally:
+        conn.close()
+    line = rows[0] if rows else ""
+    if line.startswith("SEARCH"):
+        if "INTEGER PRIMARY KEY" in line:
+            return "rowid", line
+        m = re.search(r"INDEX (\S+) ", line)
+        if m:
+            return "index:" + m.group(1), line
+    return "scan", line
+
+
+def index_vs_scan(work):
+    conn = sqlite3.connect("file:%s?mode=ro" % os.path.join(work, "idx.db"), uri=True)
+    # The key values at the edges of the index come from SQLite, not from an
+    # idea of what the fixture holds: the first and last entry of a b-tree are
+    # where a pruning rule that is off by one stops pruning or over-prunes.
+    lo, hi = conn.execute(
+        "SELECT min(name), max(name) FROM emp WHERE name IS NOT NULL").fetchone()
+    common = conn.execute(
+        "SELECT name FROM emp WHERE name IS NOT NULL GROUP BY name"
+        " ORDER BY count(*) DESC, name LIMIT 1").fetchone()[0]
+    # A blob key that is really in the index, taken from SQLite rather than
+    # worked out from how the fixture was generated. X'0007' looked like a
+    # plausible tag and matches no row, so that case was seeking a key that
+    # was not there and never reached the table at all.
+    blob = conn.execute("SELECT hex(tag) FROM emp WHERE id = 100").fetchone()[0]
+    conn.close()
+    # Two keys from the overflowing index, chosen by where they sit on their
+    # leaf page rather than at random. The lowest key in the whole index is
+    # the first cell of the first leaf, and L043 is the last of four on its
+    # leaf, so between them the entries that FOLLOW the match differ -- which
+    # is what a walk that fails to stop at the end of the matching run reads
+    # on into. With "L042-" alone, which happens to sit where its successors
+    # cost nothing, the mutation that drops `return 0` from the leaf survived.
+    longkey = "L000-" + "x" * 300
+    longkey2 = "L043-" + "x" * 300
+
+    # (database, SQL, the path sqlr takes, the path SQLite reports, the pages
+    # the chosen path touches or None for a scan).
+    #
+    # The SQLite column is measured, not predicted: it picks i_desc over
+    # i_name for an equality on `name` because i_desc covers the query, which
+    # is worth pinning -- if a later SQLite changes its mind, this says so
+    # rather than quietly comparing against something else.
+    #
+    # The page count is the exact number, not "fewer than the scan". Three
+    # mutations of the pruning rules return the right rows from the wrong
+    # number of pages: descending a child that can only hold smaller keys,
+    # reading on past the end of the matching run, and emitting an interior
+    # key that is not equal. All three survive an inequality and die against
+    # the count. It is pinned to how this SQLite fills pages, which the
+    # dbstat assertions above already depend on.
+    cases = [
+        ("idx", "SELECT id, name FROM emp WHERE name = '%s'" % lo, "index:i_name", "index:i_desc", 4),
+        ("idx", "SELECT id, name FROM emp WHERE name = '%s'" % hi, "index:i_name", "index:i_desc", 4),
+        ("idx", "SELECT id, name FROM emp WHERE name = '%s'" % common, "index:i_name", "index:i_desc", 10),
+        ("idx", "SELECT id, name FROM emp WHERE name = 'AAAA'", "index:i_name", "index:i_desc", 2),
+        ("idx", "SELECT id, name FROM emp WHERE name = 'zzzzzz'", "index:i_name", "index:i_desc", 2),
+        # 285 of the 2,000 rows match and the seek loses badly: 573 pages
+        # against the scan's 12, because it re-descends the table b-tree once
+        # per matching row. Asserted rather than hidden. See the README.
+        ("idx", "SELECT id, salary FROM emp WHERE salary = 300.0", "index:i_sal", "index:i_sal", 573),
+        ("idx", "SELECT id, salary FROM emp WHERE salary = 300", "index:i_sal", "index:i_sal", 573),
+        # The tag values repeat every 256 rows, so eight rows match and eight
+        # descents of the table cost 18 pages against the scan's 12. Same
+        # shape as the salary case below, found by pinning the count.
+        ("idx", "SELECT id, tag FROM emp WHERE tag = X'%s'" % blob, "index:i_tag", "index:i_tag", 18),
+        ("idx", "SELECT id, dept FROM emp WHERE dept = 'd3'", "scan", "index:i_dept_sal", None),
+        ("idx", "SELECT id, name FROM emp WHERE name IS NULL", "scan", "index:i_desc", None),
+        ("idx", "SELECT id, name FROM emp WHERE name > 'N5'", "scan", "index:i_desc", None),
+        ("idx", "SELECT id, name FROM emp WHERE id = 1999", "rowid", "rowid", 2),
+        ("idx", "SELECT id, name FROM emp WHERE rowid = 1", "rowid", "rowid", 2),
+        ("idx", "SELECT id FROM emp WHERE id = 2.0", "scan", "rowid", None),
+        ("idx", "SELECT id FROM emp WHERE id = '7'", "rowid", "rowid", 2),
+        ("noseek", "SELECT a FROM p WHERE a = 'a042'", "scan", "scan", None),
+        ("noseek", "SELECT b FROM p WHERE b = 'B042'", "scan", "index:p_desc", None),
+        ("noseek", "SELECT c FROM p WHERE c = 7.0", "scan", "scan", None),
+        ("noseek", "SELECT d FROM p WHERE d = 'd1'", "scan", "scan", None),
+        ("noseek", "SELECT e FROM p WHERE e = 1234", "index:p_e", "index:p_e", 5),
+        ("ixovf", "SELECT k FROM lk WHERE k = '%s'" % longkey, "index:ix_long", "index:ix_long", 8),
+        ("ixovf", "SELECT k FROM lk WHERE k = '%s'" % longkey2, "index:ix_long", "index:ix_long", 22),
+        ("ixovf", "SELECT k, v FROM u WHERE k = 'key100'", "scan", "index:sqlite_autoindex_u_1", None),
+        ("tiny", "SELECT * FROM one WHERE a = 42", "scan", "scan", None),
+        ("deep", "SELECT s FROM d WHERE id = 33333", "rowid", "rowid", 4),
+    ]
+
+    seeks = scans = 0
+    best = (1.0, "")
+    for name, sql, want_path, want_sqlite, want_pages in cases:
+        db = os.path.join(work, name + ".db")
+        tag = "%s :: %s" % (name, sql if len(sql) < 70 else sql[:67] + "...")
+
+        chosen = run(["--plan", db, sql])
+        got, pages = plan_of(chosen.stderr)
+        forced = run(["--plan", "--scan", db, sql])
+        scan_tag, scan_pages = plan_of(forced.stderr)
+
+        if chosen.returncode != 0 or forced.returncode != 0 or got is None \
+                or pages is None or scan_pages is None:
+            # Report rather than raise. A mutation that turns one of the scan
+            # cases into a seek leaves want_pages at None, and the first
+            # version of the page assertion below formatted that with %d and
+            # died with a TypeError -- after the per-kind counters had been
+            # updated and before they were printed. The mutant was caught and
+            # the run said so with a traceback instead of a failure line,
+            # which a sweep reading exit codes scores as an unknown.
+            check(False, tag, "sqlr exited %d/%d, plan %r, pages %r/%r: %r"
+                  % (chosen.returncode, forced.returncode, got, pages, scan_pages,
+                     chosen.stderr[:300]), kind="self")
+            continue
+
+        # Which path ran, asserted per query rather than left to the row
+        # comparison, which passes either way.
+        check(got == want_path, "%s: sqlr takes the %s path" % (tag, want_path),
+              "sqlr says %s" % got, kind="self")
+        check(scan_tag == "scan", "%s: --scan forces the scan" % tag,
+              "sqlr says %s" % scan_tag, kind="self")
+        if got == "scan":
+            scans += 1
+        else:
+            seeks += 1
+            # A seek that quietly reads every page is a seek in name only, and
+            # every row comparison passes for it.
+            check(pages == want_pages, "%s: the seek touches %s pages" % (tag, want_pages),
+                  "touched %d, and the scan touches %d" % (pages, scan_pages), kind="self")
+            if pages < scan_pages and pages:
+                ratio = scan_pages / pages
+                if ratio > best[0]:
+                    best = (ratio, "%s: %d pages against %d" % (tag, pages, scan_pages))
+
+        # The two paths against each other. Byte-exact, no oracle involved.
+        check(chosen.stdout == forced.stdout,
+              "%s: the chosen path and the forced scan return the same bytes" % tag,
+              "chosen %d bytes, scan %d bytes\n    %r\n    %r"
+              % (len(chosen.stdout), len(forced.stdout),
+                 chosen.stdout[:200], forced.stdout[:200]), kind="self")
+
+        # And both against SQLite, byte for byte. The oracle query carries an
+        # ORDER BY rowid that sqlr is never given: neither query asks for an
+        # order, so SQLite is free to return a different one when it picks a
+        # different index, and comparing the rows as a set instead would stop
+        # checking the order altogether. A table b-tree walk emits rows in
+        # rowid order by construction, the seek emits the same bytes as that
+        # walk (asserted above), and SQLite is the authority for what rowid
+        # order contains.
+        sq_tag, sq_line = sqlite_plan(db, sql)
+        check(sq_tag == want_sqlite, "%s: SQLite reports the %s path" % (tag, want_sqlite),
+              "EXPLAIN QUERY PLAN says %r" % sq_line)
+        want = oracle_query(db, sql + " ORDER BY rowid", False)
+        check(chosen.stdout == want, "%s: same bytes as SQLite in rowid order" % tag,
+              "sqlr %d bytes, sqlite %d bytes\n    %r\n    %r"
+              % (len(chosen.stdout), len(want), chosen.stdout[:200], want[:200]))
+        if sq_tag != got:
+            notes.append("%s\n      sqlr %s, SQLite %r" % (tag, got, sq_line))
+
+    # Both halves non-zero. A corpus where every query fell back to the scan
+    # would pass every row comparison above and prove nothing about indexes.
+    check(seeks > 0 and scans > 0,
+          "both access paths were exercised: %d seeks, %d fell back to a scan"
+          % (seeks, scans), kind="self")
+    check(best[0] >= 100,
+          "the sharpest seek reads at least 100x fewer pages than its scan",
+          "best was %.0fx -- %s" % (best[0], best[1]), kind="self")
+    return seeks, scans
+
+def overread_gate(work):
+    """Plant a read one byte past an assembled index key and require ASan to
+    see it. This is a gate on the SANITIZER, not on sqlr: a payload buffer
+    rounded up to the next power of two leaves such a read inside live memory,
+    ASan says nothing, and every bounds check in the file stops being checked
+    by the sanitised run. rec_room allocates exactly the payload length for
+    that reason, and the only way to know it still does is to plant the read.
+
+    The fixture is as much the subject as the buffer is. ixovf's index keys are
+    305 bytes on 512-byte pages, so every one of them overflows and is
+    assembled into an exact allocation; the same plant against idx.db, whose
+    keys are short enough to stay on their page, reports NOTHING, because the
+    read then lands inside the buffer holding the whole file. That is measured,
+    and it is in the README. A suite that planted this against the short-key
+    fixture alone would have called the check green forever.
+
+    Exit code 86: sqlr itself produces 0, 1 or 2 and nothing else, so 86 cannot
+    be a crash, a usage error or a clean refusal. detect_leaks=0 because sqlr
+    never frees its schema, and LeakSanitizer would otherwise exit 86 by
+    itself and pass this gate with no plant in the tree at all.
+    """
+    cc = os.environ.get("CC", "cc")
+    exe = os.path.join(work, "sqlr-overread")
+    build = subprocess.run(
+        [cc, "-std=c11", "-O1", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
+         "-DSQLR_OVERREAD", "-o", exe, os.path.join(ROOT, "sqlr.c"), "-lm"],
+        capture_output=True)
+    if build.returncode != 0:
+        check(False, "overread: the planted-read build compiles",
+              build.stderr.decode("utf-8", "replace")[:400], kind="robust")
+        return
+    sql = "SELECT k FROM lk WHERE k = '%s'" % ("L042-" + "x" * 300)
+    p = subprocess.run([exe, os.path.join(work, "ixovf.db"), sql], capture_output=True,
+                       env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0:exitcode=86"))
+    check(p.returncode == 86 and b"heap-buffer-overflow" in p.stderr,
+          "overread: ASan sees a read one byte past an assembled index key",
+          "exit %d, stderr %r" % (p.returncode, p.stderr[-300:]), kind="robust")
 
 # ------------------------------------------------------------- robustness
 # A file-format parser is fed untrusted bytes. Truncated and corrupted input
@@ -895,7 +1209,7 @@ def truncation_sweep(src, cmds, psize, nspread):
     check(not bad,
           "%s: %d truncation offsets x %d commands error cleanly"
           % (os.path.basename(src), len(offsets), len(cmds)),
-          "\n    ".join(bad[:8]))
+          "\n    ".join(bad[:8]), kind="robust")
 
 
 def corruption_sweep(src, cmds, trials, seed, limit=None):
@@ -916,7 +1230,7 @@ def corruption_sweep(src, cmds, trials, seed, limit=None):
         if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
             bad.append("flip@%d %s -> rc=%d %r" % (off, c[0], p.returncode, p.stderr[:300]))
     check(not bad, "%s: %d single-byte corruptions error cleanly"
-          % (os.path.basename(src), trials), "\n    ".join(bad[:8]))
+          % (os.path.basename(src), trials), "\n    ".join(bad[:8]), kind="robust")
 
 
 def robustness():
@@ -938,9 +1252,15 @@ def robustness():
     #     as a table one. The index reader has its own cell format and its
     #     own payload threshold; neither is reached by the three sweeps
     #     above, all of which run over table b-trees only.
+    #     The fourth command is an index SEEK rather than a dump, so the
+    #     pruning rules, the per-entry rowid and the table descent that
+    #     follows each match all get the truncation sweep as well. Those are
+    #     error paths of their own: an entry whose last column is not a rowid,
+    #     and a table root that a truncated file no longer holds.
+    ixseek = "SELECT k FROM lk WHERE k = '%s'" % ("L000-" + "x" * 300)
     truncation_sweep(os.path.join(WORK, "ixovf.db"),
                      [[".indexes"], [".index", "ix_long"],
-                      [".index", "sqlite_autoindex_u_1"]], 512, 120)
+                      [".index", "sqlite_autoindex_u_1"], [ixseek]], 512, 120)
 
     # Single-byte corruption across the first few pages: page types, cell
     # counts, cell pointers and record varints all live here, and a wrong value
@@ -955,7 +1275,7 @@ def robustness():
     corruption_sweep(os.path.join(WORK, "ixovf.db"),
                      [[".indexes"], [".index", "ix_long"],
                       [".index", "sqlite_autoindex_u_1"],
-                      ["SELECT * FROM u WHERE v = 7"]], 300, 20261018)
+                      ["SELECT * FROM u WHERE v = 7"], [ixseek]], 300, 20261018)
 
     with open(os.path.join(WORK, "types.db"), "rb") as f:
         whole = f.read()
@@ -989,10 +1309,11 @@ def robustness():
             if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
                 okall = False
                 check(False, "degenerate %s" % name,
-                      "%s rc=%d %r" % (c[0], p.returncode, p.stderr[:300]))
+                      "%s rc=%d %r" % (c[0], p.returncode, p.stderr[:300]),
+                      kind="robust")
                 break
         if okall:
-            check(True, "degenerate %s errors cleanly" % name)
+            check(True, "degenerate %s errors cleanly" % name, kind="robust")
 
 
 def index_page_corruptions():
@@ -1026,10 +1347,10 @@ def index_page_corruptions():
     # page and a type 5 page, read out of the file rather than inferred.
     check(whole[ioff] == 2,
           "ixovf: the ix_long root is an index interior page (type 2)",
-          "page %d type byte is %d" % (iroot, whole[ioff]))
+          "page %d type byte is %d" % (iroot, whole[ioff]), kind="self")
     check(whole[toff] == 5,
           "ixovf: the lk root is a table interior page (type 5)",
-          "page %d type byte is %d" % (troot, whole[toff]))
+          "page %d type byte is %d" % (troot, whole[toff]), kind="self")
 
     def attack(name, patch, argv, needle):
         b = bytearray(whole)
@@ -1040,7 +1361,7 @@ def index_page_corruptions():
         check(p.returncode == 1 and needle in p.stderr
               and b"Sanitizer" not in p.stderr and b"runtime error" not in p.stderr,
               "corrupt ixovf: %s" % name,
-              "rc=%d err=%r" % (p.returncode, p.stderr[:300]))
+              "rc=%d err=%r" % (p.returncode, p.stderr[:300]), kind="robust")
 
     def settype(off, t):
         return lambda b: b.__setitem__(off, t)
@@ -1068,9 +1389,9 @@ def readonly_check():
     with open(src, "rb") as f:
         after = hashlib.sha256(f.read()).hexdigest()
     check(before == after and mode_before == os.stat(src).st_mode,
-          "database file is unchanged after reading it")
+          "database file is unchanged after reading it", kind="robust")
     check(not any(os.path.exists(src + s) for s in ("-journal", "-wal", "-shm")),
-          "sqlr created no journal or WAL sidecar")
+          "sqlr created no journal or WAL sidecar", kind="robust")
 
 
 def main():
@@ -1093,20 +1414,34 @@ def main():
         print("%d databases, %d comparison cases" % (n, len(CASES)))
 
         compare_cases()
+        print("access paths over those cases: "
+              + ", ".join("%d %s" % (v, k) for k, v in sorted(paths.items())))
         refusals()
+        seeks, scans = index_vs_scan(WORK)
+        print("index against scan: %d queries seeked, %d fell back to a scan"
+              % (seeks, scans))
         index_page_corruptions()
+        overread_gate(WORK)
         readonly_check()
         print("robustness: truncating and corrupting ...")
         robustness()
     finally:
         shutil.rmtree(WORK, ignore_errors=True)
 
+    if notes:
+        print("\nSQLITE PICKED A DIFFERENT ACCESS PATH (rows still compared):")
+        for n in notes:
+            print("  - " + n)
     if failures:
         print("\nFAILURES:")
         for f in failures:
             print("  - " + f)
-    print("\n%d agree, %d disagree" % (agree, disagree))
-    return 1 if disagree else 0
+    print()
+    for k in KINDS:
+        print("%4d %s, %d failed" % (passed[k], KIND_WHAT[k], failed[k]))
+    bad = sum(failed.values())
+    print("%4d checks, %d failed" % (sum(passed.values()) + bad, bad))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

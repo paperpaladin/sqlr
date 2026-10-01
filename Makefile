@@ -19,9 +19,17 @@ test: sqlr
 # shortcut: leak detection is off. The process parses one query and exits, so
 # the schema and query allocations are deliberately never freed; the upgrade
 # path is a freeing teardown, not an arena.
+#
+# halt_on_error=1, and it is not cosmetic. UBSan reports and CONTINUES by
+# default, so a finding reaches stderr while the process exits 0 with the
+# right rows on stdout. The truncation and corruption sweeps grep stderr for
+# "runtime error" and would still catch it; the comparison cases compare
+# stdout and the exit status and would not. Measured with a planted left-shift
+# of a negative value in emit_row: halt_on_error=0 gives exit 0 and the
+# correct answer beside the diagnostic, halt_on_error=1 gives exit 1.
 test-asan: sqlr-asan
 	SQLR=./sqlr-asan ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 \
-	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 ./t/run.sh
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./t/run.sh
 
 sqlr-asan: sqlr.c
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined \

@@ -8,7 +8,13 @@
  *   sqlr DB.sqlite .dbinfo
  *   sqlr DB.sqlite .tables
  *   sqlr DB.sqlite .schema
- *   sqlr [--json] DB.sqlite 'SELECT a,b FROM t WHERE a = 1'
+ *   sqlr DB.sqlite .indexes
+ *   sqlr DB.sqlite .index NAME
+ *   sqlr [--json] [--scan] [--plan] DB.sqlite 'SELECT a,b FROM t WHERE a = 1'
+ *
+ * An equality WHERE is answered by descending an index when a usable one
+ * exists and by scanning the table when it does not. --scan forces the scan
+ * and --plan says on stderr which path ran.
  *
  * Exit status: 0 ok, 1 error (bad file, bad query), 2 usage.
  */
@@ -100,6 +106,7 @@ typedef struct {
 	uint32_t psize;  /* page size in bytes */
 	uint32_t usable; /* psize minus the per-page reserved region */
 	uint32_t npages;
+	uint64_t reads;  /* pages handed out by page_at, for --plan */
 } Db;
 
 /* shortcut: the whole file is slurped into RAM. Ceiling is available memory;
@@ -123,6 +130,7 @@ static int db_open(Db *db, const char *path) {
 	}
 	db->d = xmalloc((size_t)sz);
 	db->n = (size_t)sz;
+	db->reads = 0;
 	if (fread(db->d, 1, db->n, f) != db->n) {
 		fclose(f);
 		free(db->d);
@@ -172,6 +180,11 @@ static const uint8_t *page_at(Db *db, uint32_t pgno) {
 		err("page %u out of range (database has %u pages)", pgno, db->npages);
 		return NULL;
 	}
+	/* Counted, not timed: the file is already in memory, so this is the number
+	 * of pages the traversal looked at, which is the quantity a seek is
+	 * supposed to reduce. --plan prints it and the harness compares the two
+	 * paths by it, because a seek that quietly scans gives the right rows. */
+	db->reads++;
 	return db->d + (size_t)(pgno - 1) * db->psize;
 }
 
@@ -391,9 +404,66 @@ static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
 
 typedef int (*RowFn)(void *ctx, int64_t rowid, const uint8_t *payload, size_t plen);
 
-/* One walker serves both kinds of b-tree. They differ in exactly three places:
- * the page type bytes, whether an interior cell carries a key as well as a
- * child pointer, and the local-payload threshold.
+static int cmp_vals(const Val *a, const Val *b); /* with the affinity rules below */
+
+/* An access path that looks for one key instead of visiting every row. The
+ * two b-trees are keyed differently, so this holds both keys and walk() reads
+ * whichever one the page it is on calls for: a table b-tree is keyed by
+ * rowid, an index b-tree by the record its cells hold. There is no field
+ * saying which, because the page type already does and a second answer to the
+ * same question is a second answer that can be wrong. */
+typedef struct {
+	int64_t rowid; /* table seek: the rowid to find */
+	Val key;       /* index seek: the literal, with the column's affinity applied */
+} Seek;
+
+/* Compare an index entry's first column against the key being sought. The
+ * ordering has to be the one the index was written in, which for a BINARY
+ * collation on an ASC key is what cmp_vals computes; an index whose first key
+ * is COLLATE or DESC is declined by pick_path rather than guessed at.
+ *
+ * Nothing here re-floats an integer stored in a REAL-affinity column, which
+ * emit_row and index_row both have to do before printing it. cmp_vals already
+ * puts V_INT and V_REAL in one class and compares them as numbers, so the
+ * conversion would change no comparison -- and converting first would make
+ * two integers compare as doubles, which is worse above 2^53 rather than
+ * better. The first version of this did it anyway and the mutant that deleted
+ * it could not be killed, which is how the field came out.
+ *
+ * shortcut: cmp_vals compares an int64 against a double by widening the
+ * int64, so above 2^53 it can call two different numbers equal. The predicate
+ * in emit_row uses the same function, so the two paths still agree with each
+ * other; the upgrade path is SQLite's own exact int-against-float comparison. */
+static int key_cmp(const uint8_t *pay, size_t plen, const Seek *sk, int *out) {
+	Val v[MAXCOL];
+	int n;
+	if (rec_parse(pay, plen, v, &n) < 0) return -1;
+	if (n < 1) return err("index entry has no columns");
+#ifdef SQLR_OVERREAD
+	/* A deliberate read one byte past the key, compiled only by the harness's
+	 * overread case. The point is not the bug, it is whether the sanitizer can
+	 * SEE the bug: a payload assembled into a buffer rounded up to the next
+	 * power of two leaves this read inside live memory and ASan says nothing,
+	 * which is how a rounded-up buffer turns the sanitizer off for every
+	 * bounds check in the file. rec_room allocates exactly plen bytes so that
+	 * this is reported, and the harness requires the report. */
+	{
+		extern volatile uint8_t g_overread_sink;
+		g_overread_sink ^= pay[plen];
+	}
+#endif
+	*out = cmp_vals(&v[0], &sk->key);
+	return 0;
+}
+
+#ifdef SQLR_OVERREAD
+volatile uint8_t g_overread_sink;
+#endif
+
+/* One walker serves both kinds of b-tree, and both access paths. The trees
+ * differ in exactly three places: the page type bytes, whether an interior
+ * cell carries a key as well as a child pointer, and the local-payload
+ * threshold.
  *
  * The traversal order is the key order. On an index interior page a cell's
  * own key sorts AFTER everything in that cell's left child, so the child is
@@ -402,11 +472,23 @@ typedef int (*RowFn)(void *ctx, int64_t rowid, const uint8_t *payload, size_t pl
  * interior cell has a rowid but no payload, so there is nothing to emit in
  * between and only the order of the descents matters.
  *
+ * With `sk` non-NULL the same traversal is pruned to the subtrees that can
+ * hold the key, which is what makes it a seek rather than a scan. An interior
+ * cell's key is the largest key under that cell's child, so a child whose key
+ * is below the one sought cannot hold it and is skipped; once a key above it
+ * is reached, that child is the last one worth entering and everything to the
+ * right of it is larger. On a leaf the matching cells are a contiguous run,
+ * so the walk stops at the first key past the one sought. Nothing is emitted
+ * that the full walk would not also emit, in the same order, because the
+ * pruning only removes subtrees: that is what lets the harness diff the two
+ * paths byte for byte.
+ *
  * shortcut: an index on a WITHOUT ROWID table ends each entry with the
  * table's primary key instead of a rowid, and nothing here knows that. Those
  * tables are refused in parse_create, which is what keeps this honest; the
  * upgrade path is PLAN item 08. */
-static int walk(Scan *s, uint32_t pgno, int depth, int want_index, RowFn fn, void *ctx) {
+static int walk(Scan *s, uint32_t pgno, int depth, int want_index,
+                const Seek *sk, RowFn fn, void *ctx) {
 	Db *db = s->db;
 	if (depth > 40) return err("b-tree deeper than 40 levels; refusing to recurse");
 	if (bit_mark(s->seen, s->seenbytes, pgno))
@@ -441,11 +523,25 @@ static int walk(Scan *s, uint32_t pgno, int depth, int want_index, RowFn fn, voi
 		const uint8_t *c = pg + co;
 		const uint8_t *cend = pg + db->usable;
 
+		uint32_t child = 0;
 		if (interior) {
 			/* Both interior cell formats start with the 4-byte left child. */
 			if (cend - c < 4) return err("page %u cell %u truncated", pgno, i);
-			if (walk(s, be32(c), depth + 1, want_index, fn, ctx) < 0) return -1;
-			if (!is_index) continue; /* table interior: the rowid is not needed */
+			child = be32(c);
+			if (!is_index) {
+				/* A table interior cell is a child pointer and the largest
+				 * rowid beneath it, so a rowid seek can skip whole subtrees.
+				 * The full walk does not need the rowid at all. */
+				if (sk) {
+					uint64_t key;
+					int kb = varint(c + 4, cend, &key);
+					if (kb < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
+					if ((int64_t)key < sk->rowid) continue;
+					return walk(s, child, depth + 1, want_index, sk, fn, ctx);
+				}
+				if (walk(s, child, depth + 1, want_index, sk, fn, ctx) < 0) return -1;
+				continue;
+			}
 			c += 4;
 		}
 		/* A leaf cell, or the key half of an index interior cell: varint
@@ -459,26 +555,72 @@ static int walk(Scan *s, uint32_t pgno, int depth, int want_index, RowFn fn, voi
 			if (k < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
 			c += k;
 		}
+		size_t room = (size_t)(cend - c);
 		const uint8_t *pay;
-		if (payload_read(s, c, plen, (size_t)(cend - c), is_index, &pay) < 0) return -1;
-		if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+
+		if (!is_index) { /* a table leaf cell */
+			if (sk) {
+				if ((int64_t)rowid < sk->rowid) continue;
+				if ((int64_t)rowid > sk->rowid) return 0;
+			}
+			if (payload_read(s, c, plen, room, 0, &pay) < 0) return -1;
+			if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+			continue;
+		}
+
+		/* An index cell: the key is the record itself. */
+		int cmp = 0;
+		if (sk) {
+			if (payload_read(s, c, plen, room, 1, &pay) < 0) return -1;
+			if (key_cmp(pay, (size_t)plen, sk, &cmp) < 0) return -1;
+			if (cmp < 0) continue;      /* leaf: before the run. interior: the
+			                             * child holds nothing but smaller keys */
+			if (cmp > 0 && !interior) return 0; /* past the run */
+		}
+		if (interior) {
+			if (walk(s, child, depth + 1, want_index, sk, fn, ctx) < 0) return -1;
+			if (cmp > 0) return 0; /* that child was the last one that could hold it */
+		}
+		if (!sk || cmp == 0) {
+			/* Re-read: the descent above reuses the one record buffer, so the
+			 * key compared a few lines up is no longer in it. */
+			if (payload_read(s, c, plen, room, 1, &pay) < 0) return -1;
+			if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+		}
 	}
 	if (interior) {
 		/* The right-most child hangs off the page header, not the cell array;
-		 * visiting it last is what keeps a scan in key order. */
-		if (walk(s, be32(h + 8), depth + 1, want_index, fn, ctx) < 0) return -1;
+		 * visiting it last is what keeps a scan in key order. A seek reaches
+		 * here only when every key on the page is below the one sought, in
+		 * which case this is the subtree that can still hold it. */
+		if (walk(s, be32(h + 8), depth + 1, want_index, sk, fn, ctx) < 0) return -1;
 	}
 	return 0;
 }
 
 static int scan_table(Scan *s, uint32_t root, RowFn fn, void *ctx) {
 	memset(s->seen, 0, s->seenbytes);
-	return walk(s, root, 0, 0, fn, ctx);
+	return walk(s, root, 0, 0, NULL, fn, ctx);
 }
 
 static int scan_index(Scan *s, uint32_t root, RowFn fn, void *ctx) {
 	memset(s->seen, 0, s->seenbytes);
-	return walk(s, root, 0, 1, fn, ctx);
+	return walk(s, root, 0, 1, NULL, fn, ctx);
+}
+
+/* One row by rowid: a descent of the table b-tree instead of a walk of it. */
+static int seek_table(Scan *s, uint32_t root, int64_t rowid, RowFn fn, void *ctx) {
+	Seek sk;
+	memset(&sk, 0, sizeof sk);
+	sk.rowid = rowid;
+	memset(s->seen, 0, s->seenbytes);
+	return walk(s, root, 0, 0, &sk, fn, ctx);
+}
+
+/* Every entry of an index whose first key column equals sk->key. */
+static int seek_index(Scan *s, uint32_t root, const Seek *sk, RowFn fn, void *ctx) {
+	memset(s->seen, 0, s->seenbytes);
+	return walk(s, root, 0, 1, sk, fn, ctx);
 }
 
 /* ------------------------------------------------------- string helpers */
@@ -574,6 +716,12 @@ static char *ident(const char **pp) {
 			out[k++] = *p++;
 		}
 		out[k] = 0;
+		/* Also sized by the rest of the statement and filled with a name.
+		 * An identifier IS read as a C string (ci_eq, strcmp), so the
+		 * terminator stays and the trim keeps it: a read at out[k + 1] is
+		 * then past the end rather than tens of bytes inside. */
+		char *exact = realloc(out, k + 1);
+		if (exact) out = exact;
 		*pp = p;
 		return out;
 	}
@@ -910,7 +1058,7 @@ static int parse_literal(const char **pp, Val *v, uint8_t **own) {
 		if (*p != '\'') return err("unterminated blob literal");
 		size_t nh = (size_t)(p - st);
 		if (nh % 2) return err("blob literal has an odd number of hex digits");
-		uint8_t *b = xmalloc(nh / 2 + 1);
+		uint8_t *b = xmalloc(nh / 2);
 		for (size_t i = 0; i < nh; i += 2) {
 			int hi = hexval(st[i]), lo = hexval(st[i + 1]);
 			if (hi < 0 || lo < 0) { free(b); return err("bad hex digit in blob literal"); }
@@ -931,6 +1079,17 @@ static int parse_literal(const char **pp, Val *v, uint8_t **own) {
 			if (*p == '\'') {
 				if (p[1] == '\'') { out[k++] = '\''; p += 2; continue; }
 				p++;
+				/* Trim to what was parsed. This was allocated for the whole
+				 * rest of the query text, so a two-byte literal in a long
+				 * query sat in a buffer with room to spare, and a read past
+				 * its end landed inside the allocation where ASan cannot see
+				 * it. The bytes are length-counted everywhere (memcmp in
+				 * cmp_vals, fwrite in put_tsv), never read as a C string, so
+				 * dropping the terminator costs nothing and is the point:
+				 * with it, a read at out[k] would be the NUL and still
+				 * inside. */
+				char *exact = realloc(out, k ? k : 1);
+				if (exact) out = exact;
 				v->t = V_TEXT;
 				v->s = (uint8_t *)out;
 				v->n = (uint32_t)k;
@@ -1080,6 +1239,120 @@ static Idx *index_find(Schema *sc, const char *name) {
 	for (int i = 0; i < sc->nix; i++)
 		if (ci_eq(sc->ix[i].name, name)) return &sc->ix[i];
 	return NULL;
+}
+
+/* ------------------------------------------------- choosing an access path */
+
+/* The sole key column of an index sqlr is willing to seek, or NULL.
+ *
+ * Narrow on purpose. Everything turned down here falls back to the full scan,
+ * which is the path SQLite already agrees with on every case in the corpus,
+ * so a decline costs time and nothing else. Using the wrong index, or using
+ * one in the wrong order, is a wrong answer. The two are different failures
+ * and the harness counts them separately.
+ *
+ * Turned down, and why:
+ *   more than one key column   the entries that share a first column are then
+ *                              ordered by the second, not by rowid, so a seek
+ *                              would emit the matching rows in a different
+ *                              order from the scan and there is no sort to put
+ *                              them back. shortcut: upgrade path is PLAN item
+ *                              11, ORDER BY.
+ *   COLLATE or DESC            the stored order is not the order cmp_vals
+ *                              computes, so the pruning would skip subtrees
+ *                              that do hold the key
+ *   an expression              `ON t(abs(c))` indexes a value no column holds
+ *   a partial index            it does not hold every row of the table, so it
+ *                              can only answer a query that implies its WHERE
+ *   no CREATE statement        sqlite_autoindex_* rows carry no SQL, so the
+ *                              key columns are unknown
+ */
+static char *index_sole_column(const Idx *x) {
+	if (!x->sql) return NULL;
+	const char *p = strchr(x->sql, '(');
+	if (!p) return NULL;
+	const char *start = ++p;
+	int depth = 0;
+	for (; *p; p++) {
+		if (*p == '\'' || *p == '"' || *p == '`') {
+			char qc = *p++;
+			while (*p && *p != qc) p++;
+			if (!*p) return NULL;
+			continue;
+		}
+		if (*p == '(') depth++;
+		else if (*p == ')') {
+			if (!depth) break;
+			depth--;
+		} else if (*p == ',' && !depth) return NULL; /* a second key column */
+	}
+	if (*p != ')') return NULL;
+	const char *tail = p + 1;
+	if (word(&tail, "where")) return NULL; /* partial: not every row is in it */
+
+	char *frag = dupn((const uint8_t *)start, (size_t)(p - start));
+	const char *f = frag;
+	char *nm = ident(&f);
+	skipws(&f);
+	/* A bare column name, optionally ASC, and nothing else. */
+	if (nm && *f) {
+		if (word(&f, "asc")) skipws(&f);
+		if (*f) {
+			free(nm);
+			nm = NULL;
+		}
+	}
+	free(frag);
+	return nm;
+}
+
+/* Pick the access path for a parsed query. Returns the index to seek, or NULL
+ * to scan; *byrowid is set when the table b-tree's own key answers it. */
+static Idx *pick_path(Schema *sc, Table *t, const Query *q, const Val *lit, int *byrowid) {
+	*byrowid = 0;
+	if (q->op != OP_EQ || lit->t == V_NULL) return NULL;
+	/* The table b-tree IS the index on the rowid, so an equality on the rowid
+	 * or on the INTEGER PRIMARY KEY that aliases it is a descent rather than a
+	 * scan. The literal has to have come out of affinity as an integer: SQLite
+	 * would still search for `rowid = 2.0`, and declining that is a slower
+	 * answer, not a wrong one. */
+	if (q->wcol < 0 || (t->ipk >= 0 && q->wcol == t->ipk)) {
+		if (lit->t == V_INT) *byrowid = 1;
+		return NULL;
+	}
+	for (int i = 0; i < sc->nix; i++) {
+		Idx *x = &sc->ix[i];
+		if (!x->tbl || !ci_eq(x->tbl, t->name)) continue;
+		char *nm = index_sole_column(x);
+		if (!nm) continue;
+		int ci = col_index(t, nm);
+		free(nm);
+		if (ci == q->wcol) return x;
+	}
+	return NULL;
+}
+
+/* An index entry that matched, turned into the table row it points at. The
+ * descent happens in the middle of the index walk, so it gets a Scan of its
+ * own: one record buffer cannot hold an index key and a table row at once. */
+typedef struct {
+	Scan *rs;
+	uint32_t root;
+	RowFn fn;
+	void *ctx;
+	long long hits;
+} Fetch;
+
+static int fetch_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
+	Fetch *f = ctx;
+	Val v[MAXCOL];
+	int n;
+	(void)rowid; /* an index entry carries its rowid inside the record */
+	if (rec_parse(pay, plen, v, &n) < 0) return -1;
+	if (n < 2 || v[n - 1].t != V_INT)
+		return err("index entry does not end with a rowid");
+	f->hits++;
+	return seek_table(f->rs, f->root, v[n - 1].i, f->fn, f->ctx);
 }
 
 /* ------------------------------------------------------------- query parsing */
@@ -1343,16 +1616,22 @@ static int cmp_name(const void *a, const void *b) {
 }
 
 static int usage(void) {
-	fputs("usage: sqlr [--json] DB.sqlite "
+	fputs("usage: sqlr [--json] [--scan] [--plan] DB.sqlite "
 	      "{.dbinfo | .tables | .schema | .indexes | .index NAME | SELECT ...}\n", stderr);
 	return 2;
 }
 
 int main(int argc, char **argv) {
-	int json = 0, i = 1;
+	int json = 0, noindex = 0, plan = 0, i = 1;
 	for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
 		if (!strcmp(argv[i], "--json")) json = 1;
 		else if (!strcmp(argv[i], "--tsv")) json = 0;
+		/* --scan forces the full table scan even where an index would do, so
+		 * the harness can diff the two paths against each other; --plan
+		 * reports which path ran, and how many pages it touched, on stderr so
+		 * that stdout is still just the rows. */
+		else if (!strcmp(argv[i], "--scan")) noindex = 1;
+		else if (!strcmp(argv[i], "--plan")) plan = 1;
 		else return usage();
 	}
 	/* `.index NAME` is the one form that takes an argument of its own. */
@@ -1438,14 +1717,57 @@ int main(int argc, char **argv) {
 			Emit e = {&q, t, stdout, json, AFF_BLOB, 0};
 			if (q.op != OP_NONE)
 				e.waff = (q.wcol < 0) ? AFF_INT : t->aff[q.wcol];
+			/* The literal with the column's affinity applied. emit_row does
+			 * this again per row for the predicate; a seek needs it up front,
+			 * because it is the key the descent compares against, and the two
+			 * have to be the same value or the seek and the predicate would
+			 * disagree about what matches. litbuf holds the converted text and
+			 * so has to outlive the walk. */
+			char litbuf[64];
+			Val lit = q.wval;
+			if (q.op != OP_NONE)
+				apply_affinity(e.waff, &lit, litbuf, sizeof litbuf);
+			int byrowid = 0;
+			Idx *x = noindex ? NULL : pick_path(&schema, t, &q, &lit, &byrowid);
+			if (plan) {
+				if (x)
+					fprintf(stderr, "plan: search %s using index %s (%s=?)\n",
+					        t->name, x->name, t->col[q.wcol]);
+				else if (byrowid)
+					fprintf(stderr, "plan: search %s using rowid (rowid=?)\n", t->name);
+				else
+					fprintf(stderr, "plan: scan %s\n", t->name);
+			}
+			/* Pages touched loading the schema are not the query's own work. */
+			db.reads = 0;
 			if (json) fputc('[', stdout);
-			if (scan_table(&sc, t->root, emit_row, &e) < 0) {
+			int failed;
+			if (x) {
+				/* The index gives candidate rowids; emit_row still applies the
+				 * WHERE to the row it fetches, so the predicate stays the one
+				 * authority on what matches and a seek that over-returns
+				 * cannot turn into a wrong row. */
+				Scan rs;
+				scan_init(&rs, &db);
+				Seek sk;
+				memset(&sk, 0, sizeof sk);
+				sk.key = lit;
+				Fetch f = {&rs, t->root, emit_row, &e, 0};
+				failed = seek_index(&sc, x->root, &sk, fetch_row, &f) < 0;
+				scan_free(&rs);
+			} else if (byrowid) {
+				failed = seek_table(&sc, t->root, lit.i, emit_row, &e) < 0;
+			} else {
+				failed = scan_table(&sc, t->root, emit_row, &e) < 0;
+			}
+			if (failed) {
 				if (json) fputc('\n', stdout);
 				fprintf(stderr, "sqlr: %s\n", g_err);
 				rc = 1;
 			} else if (json) {
 				fputs("]\n", stdout);
 			}
+			if (plan) fprintf(stderr, "pages: %" PRIu64 "\n", db.reads);
 		}
 	}
 	if (fflush(stdout) != 0) {

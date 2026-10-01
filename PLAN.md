@@ -10,7 +10,7 @@ it, without linking libsqlite3 and without ever writing a byte.
     sqlr DB.sqlite .schema            # each CREATE statement, semicolon-terminated
     sqlr DB.sqlite .indexes           # index names, one per line, sorted
     sqlr DB.sqlite .index NAME        # that index's b-tree, in key order, as TSV
-    sqlr [--json] DB.sqlite 'SELECT'  # rows, as TSV (default) or JSON
+    sqlr [--json] [--scan] [--plan] DB.sqlite 'SELECT'   # rows, TSV or JSON
 
 The query grammar is exactly:
 
@@ -18,6 +18,16 @@ The query grammar is exactly:
            [WHERE <col> {= == != <> < <= > >=} <literal> | <col> IS [NOT] NULL]
 
 Literals are integers, reals, `'text'` (with `''` escapes), `X'hex'` and `NULL`.
+
+An equality `WHERE` is answered by descending an index where a usable one
+exists and by scanning the table where it does not. Usable means: the rowid
+or the INTEGER PRIMARY KEY aliasing it, with an integer literal, which is the
+table b-tree's own key; or a single-column index with no `COLLATE`, no `DESC`,
+no expression, not partial, and with a CREATE statement to read its key column
+out of. Anything else falls back to the scan rather than guessing. `--scan`
+forces the scan, and `--plan` prints the path taken and the number of pages it
+touched on stderr, so stdout stays byte-comparable.
+
 `.dbinfo` reports page size, page count, reserved bytes, text encoding, schema
 cookie, user version and freelist page count, every one of which SQLite also
 reports through a PRAGMA, so the header parse is checked field by field.
@@ -48,13 +58,18 @@ SQLite's own `X'HEX'` literal, and a REAL renders the way SQLite renders it
 byte-identical to the answer SQLite gives for the same query, and malformed
 input produces an error, never a crash, a hang, or a wrong row.**
 
-Both halves are enforced by `make test`, which prints `N agree, M disagree` and
-exits nonzero if M is not zero. The second half is checked by truncating three
-valid databases at every page boundary and at a spread of other offsets,
-flipping single bytes through the first pages, and feeding in hand-built hostile
-files including a b-tree root that is its own child; the only acceptable
-outcomes are exit 0 or exit 1 with no sanitizer report. `make test-asan` runs the
-identical harness under `-fsanitize=address,undefined`.
+Both halves are enforced by `make test`. It counts its checks by what the
+authority for each one was, keeping agreements with SQLite apart from
+refusals, from hostile-input checks and from the ones with no outside
+authority, and exits nonzero if any of the four has a failure.
+
+The second half is checked by truncating four valid databases at every page
+boundary and at a spread of other offsets, flipping single bytes through the
+first pages, and feeding in hand-built hostile files including a b-tree root
+that is its own child; the only acceptable outcomes are exit 0 or exit 1 with
+no sanitizer report. `make test-asan` runs the identical harness under
+`-fsanitize=address,undefined`, with `halt_on_error=1` so that a UBSan
+finding fails a run rather than printing beside a correct answer.
 
 Secondary invariant: **sqlr never writes to a database.** The file is opened
 `"rb"`, and the harness checks the SHA-256 of a corpus database before and after
@@ -70,8 +85,19 @@ Ranked, strongest first.
    decision that could hide a sqlr bug is pushed back into SQLite: REAL text
    comes from SQLite's `CAST(x AS TEXT)` and blob hex from SQLite's `hex()`, so
    `put_real()` and `put_blob()` are checked against SQLite's own
-   formatting, not against a Python reimplementation of it. 113 comparison cases over
-   23 databases.
+   formatting, not against a Python reimplementation of it. 114 comparison cases over
+   24 databases, plus 25 that put the same query to both of sqlr's access
+   paths and to SQLite.
+
+   For an equality `WHERE` there are two comparisons and they fail on
+   different bugs. The index path must return byte for byte what `--scan`
+   returns, which needs no oracle: sqlr is on both sides, and a seek that
+   prunes a subtree it should have entered fails there. Both must then return
+   what SQLite returns, which is the half that catches a seek and a scan
+   agreeing with each other and not with the reference. `EXPLAIN QUERY PLAN`
+   is the oracle for the decision rather than the rows, and where sqlr
+   declines an index SQLite uses, the run prints the difference as a finding
+   and still requires every row to agree.
 
    For an index the expected bytes are not an ORDER BY worked out by hand.
    `INDEXED BY` makes SQLite traverse that index and emit its entries in
@@ -86,22 +112,28 @@ Ranked, strongest first.
    (3.46.1). Same engine, same authority, different front end. This is the one
    honest deviation from the brief and it is noted in the README too.
 
-2. The robustness sweep. Truncation at every page boundary of three
-   databases, 500 single-byte corruptions, and hand-built degenerate files. The
+2. The robustness sweep. Truncation at every page boundary of four
+   databases, 800 single-byte corruptions, and hand-built degenerate files. The
    oracle here is "does not misbehave", not "matches SQLite", because
    SQLite's own behaviour on a corrupt file is not a specification.
 
 3. ASan + UBSan over the whole harness (`make test-asan`). This is what
-   found the undefined left-shift of a negative value in `be_int()`.
+   found the undefined left-shift of a negative value in `be_int()`. The
+   suite also plants a read one byte past an assembled index key and requires
+   ASan to report it, which is a gate on the sanitizer rather than on sqlr:
+   the measurements behind it are in the README under "The buffer larger than
+   its data".
 
 4. valgrind on a handful of invocations, as a spot check that the clean
    build has no invalid read the sanitizers missed.
 
 ## Non-goals
 
-Writing, in any form. Using an index to answer a query: index b-trees are
-read and dumped, but every `SELECT` is still a full table scan, which is
-item 07. WAL replay. A `-wal` file is ignored,
+Writing, in any form. A cost model: there is no `sqlite_stat1` and no ANALYZE,
+so a seek matching a large fraction of a table is slower than the scan it
+replaced, measured and asserted rather than hidden. Index access for anything
+but an equality on one column. WAL replay, whose format belongs to the sibling
+`sqlwal`; a `-wal` file here is ignored,
 so an un-checkpointed database reads as its last checkpoint. `WITHOUT ROWID`
 tables, which are index b-trees. UTF-16 databases. Joins, aggregates, ORDER BY,
 LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
@@ -194,11 +226,28 @@ LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
            interior page hits on every cell; and rec_room rounded its
            allocation up, which left ASan blind to a read one byte past an
            assembled payload (measured, not assumed)
-- [ ] 07 use an index for an equality `WHERE` when one exists, falling back to
+- [x] 07 use an index for an equality `WHERE` when one exists, falling back to
       the scan, and add a harness case asserting the two paths agree with each
       other as well as with SQLite
       why: the only way to know a seek is right is to diff it against the scan
            that already matches SQLite
+      done: one `Seek` threaded through the same `walk()`, so the seek is the
+           full traversal with the subtrees that cannot hold the key pruned
+           out, and nothing can come back in a different order from the scan.
+           `--scan` forces the fallback and `--plan` reports the path and the
+           pages touched, which is what makes both halves assertable: 25 cases
+           pin the path sqlr takes, the path SQLite reports under EXPLAIN QUERY
+           PLAN, the exact page count, byte equality against the forced scan,
+           and byte equality against SQLite in rowid order. 15 seek, 10 fall
+           back. 171 -> 320 checks, and the single "agree" counter was split
+           four ways, since 35 of those 171 were not agreements with SQLite at
+           all. Three findings worth the item: a seek with no cost model is
+           much slower than the scan when many rows match (573 pages against
+           12 on an equality matching 285 of 2,000 rows), re-floating an
+           integer in a REAL column before comparing was dead code and its
+           mutant could not be killed until the field came out, and pinning
+           the page count rather than an inequality is what kills the two
+           pruning mutants that return the right rows from the wrong pages
 - [ ] 08 `WITHOUT ROWID` tables, which fall out of 06. They are index b-trees
       with the whole row as the key
       why: refusing them is honest but they are increasingly common
@@ -237,3 +286,15 @@ LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
            follows the trunk pages, so a file whose freelist is corrupt looks
            fine; accounting for every page is also how you find the pages sqlr
            never visits
+- [ ] 17 parse a record out of an allocation sized to the record, behind a
+      build flag, the way `jsonc` does it
+      why: `Val v[MAXCOL]` is a 512-entry array and a five-column record fills
+           five of it, so a read at `v[n]` stays inside the array and neither
+           ASan nor valgrind reports it. Measured with a planted read, not
+           assumed, and it is the one case in the README's table that no
+           allocation size can reach
+- [ ] 18 a table cursor, so a seek matching many rows walks the table once in
+      rowid order instead of descending from the root per row
+      why: the per-row descent is why `WHERE salary = 300` touches 573 pages
+           where the scan touches 12, and a cursor fixes it without needing
+           the statistics a cost model would want
