@@ -6,6 +6,8 @@
  *
  * Usage:
  *   sqlr DB.sqlite .dbinfo
+ *   sqlr DB.sqlite .tables
+ *   sqlr DB.sqlite .schema
  *
  * Exit status: 0 ok, 1 error (bad file, bad query), 2 usage.
  */
@@ -47,6 +49,44 @@ static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
 
 static uint32_t be32(const uint8_t *p) {
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* SQLite's varint: big-endian, 1..9 bytes. The high bit of each of the first
+ * eight bytes is a "more follows" flag and the low seven bits are payload, so
+ * eight bytes carry 56 bits; if a ninth byte is needed it contributes all eight
+ * of its bits, for 64 in total. That asymmetry is the part nobody guesses, and
+ * it is why a 9-byte varint has no continuation bit to check.
+ * Returns bytes consumed, or -1 if the varint would run past `end`. */
+static int varint(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+	uint64_t r = 0;
+	for (int i = 0; i < 8; i++) {
+		if (p + i >= end) return -1;
+		r = (r << 7) | (p[i] & 0x7f);
+		if (!(p[i] & 0x80)) {
+			*out = r;
+			return i + 1;
+		}
+	}
+	if (p + 8 >= end) return -1;
+	*out = (r << 8) | p[8];
+	return 9;
+}
+
+/* n-byte big-endian two's-complement integer, for serial types 1-6 (widths 1,
+ * 2, 3, 4, 6, 8). The sign lives in the top bit of the first byte, so start
+ * from a signed char and shift the rest in. */
+static int64_t be_int(const uint8_t *p, int n) {
+	int64_t v = (int8_t)p[0];
+	for (int i = 1; i < n; i++) v = (v << 8) | p[i];
+	return v;
+}
+
+static double be_double(const uint8_t *p) {
+	uint64_t u = 0;
+	double d;
+	for (int i = 0; i < 8; i++) u = (u << 8) | p[i];
+	memcpy(&d, &u, 8);
+	return d;
 }
 
 /* --------------------------------------------------------------- open a file */
@@ -124,10 +164,264 @@ static int db_open(Db *db, const char *path) {
 	return 0;
 }
 
+static const uint8_t *page_at(Db *db, uint32_t pgno) {
+	if (pgno < 1 || pgno > db->npages) {
+		err("page %u out of range (database has %u pages)", pgno, db->npages);
+		return NULL;
+	}
+	return db->d + (size_t)(pgno - 1) * db->psize;
+}
+
+/* ------------------------------------------------------------------- values */
+
+typedef enum { V_NULL, V_INT, V_REAL, V_TEXT, V_BLOB } Vt;
+
+typedef struct {
+	Vt t;
+	int64_t i;
+	double r;
+	const uint8_t *s; /* points into the assembled payload */
+	uint32_t n;
+} Val;
+
+#define MAXCOL 512
+
+/* The serial-type table from the format spec. Types 0 and 8/9 occupy no bytes
+ * in the body at all: 8 and 9 encode the literal integers 0 and 1, which is why
+ * a row of booleans costs one byte per column in the header and nothing else.
+ * Even types >= 12 are blobs of (t-12)/2 bytes, odd types >= 13 are text of
+ * (t-13)/2 bytes. 10 and 11 are reserved and must not appear. */
+static int serial_len(uint64_t t, uint32_t *len) {
+	switch (t) {
+	case 0: case 8: case 9: *len = 0; return 0;
+	case 1: *len = 1; return 0;
+	case 2: *len = 2; return 0;
+	case 3: *len = 3; return 0;
+	case 4: *len = 4; return 0;
+	case 5: *len = 6; return 0;
+	case 6: case 7: *len = 8; return 0;
+	case 10: case 11: return err("reserved serial type %" PRIu64 " in record", t);
+	}
+	if (t > 0x7fffffffu) return err("absurd serial type %" PRIu64, t);
+	*len = (uint32_t)((t - 12) / 2);
+	return 0;
+}
+
+/* A record is: a varint giving the total header size, then one varint serial
+ * type per column, then the bodies back to back. The header size counts itself,
+ * which is the subtle bit -- you cannot find the first body byte without first
+ * decoding a varint whose value includes the varint's own width. */
+static int rec_parse(const uint8_t *p, size_t plen, Val *v, int *nout) {
+	uint64_t hdrlen;
+	int k = varint(p, p + plen, &hdrlen);
+	if (k < 0) return err("record header size varint runs past end of payload");
+	if (hdrlen < (uint64_t)k || hdrlen > plen)
+		return err("record header size %" PRIu64 " outside %zu-byte payload", hdrlen, plen);
+
+	const uint8_t *ht = p + k, *hend = p + hdrlen;
+	const uint8_t *body = p + hdrlen, *end = p + plen;
+	int n = 0;
+
+	while (ht < hend) {
+		uint64_t st;
+		int m = varint(ht, hend, &st);
+		if (m < 0) return err("serial type varint runs past end of record header");
+		ht += m;
+		uint32_t blen;
+		if (serial_len(st, &blen) < 0) return -1;
+		if (n >= MAXCOL) return err("record has more than %d columns", MAXCOL);
+		if ((size_t)(end - body) < blen)
+			return err("record body is %zu bytes short of serial type %" PRIu64,
+			           (size_t)(blen - (end - body)), st);
+		Val *o = &v[n++];
+		memset(o, 0, sizeof *o);
+		switch (st) {
+		case 0: o->t = V_NULL; break;
+		case 8: o->t = V_INT; o->i = 0; break;
+		case 9: o->t = V_INT; o->i = 1; break;
+		case 7: o->t = V_REAL; o->r = be_double(body); break;
+		case 1: case 2: case 3: case 4: case 5: case 6:
+			o->t = V_INT;
+			o->i = be_int(body, (int)blen);
+			break;
+		default:
+			o->t = (st & 1) ? V_TEXT : V_BLOB;
+			o->s = body;
+			o->n = blen;
+		}
+		body += blen;
+	}
+	*nout = n;
+	return 0;
+}
+
+/* --------------------------------------------------------- payload assembly */
+
+/* Per-scan scratch: one growable buffer that every record is assembled into.
+ * shortcut: a scan allocates once and reuses, because a full table scan touches
+ * every row and a malloc per row would dominate. */
+typedef struct {
+	Db *db;
+	uint8_t *rec;
+	size_t reccap;
+} Scan;
+
+static void scan_init(Scan *s, Db *db) {
+	s->db = db;
+	s->rec = NULL;
+	s->reccap = 0;
+}
+
+static void scan_free(Scan *s) {
+	free(s->rec);
+}
+
+/* Point at a cell's payload. For now the whole payload must live on the leaf
+ * page; a payload long enough to spill is refused rather than half-read.
+ * shortcut: overflow pages arrive in the next commit, which is what makes the
+ * refusal below temporary rather than a limit of the design. */
+static int payload_read(Scan *s, const uint8_t *cell_payload, uint64_t plen,
+                        size_t page_room, const uint8_t **out) {
+	(void)s;
+	if (plen > page_room)
+		return err("cell payload of %" PRIu64 " bytes spills to an overflow page, "
+		           "which sqlr cannot read yet", plen);
+	*out = cell_payload;
+	return 0;
+}
+
+/* ------------------------------------------------------------ b-tree walking */
+
+typedef int (*RowFn)(void *ctx, int64_t rowid, const uint8_t *payload, size_t plen);
+
+/* shortcut: table leaf pages only (page type 13). Interior pages (type 5) and
+ * index pages (2 and 10) are recognised and refused, so a database whose table
+ * has grown past one page errors instead of silently returning a fraction of
+ * its rows -- which is the failure mode this would otherwise have. Interior
+ * pages arrive in the next commit. */
+static int walk(Scan *s, uint32_t pgno, int depth, RowFn fn, void *ctx) {
+	Db *db = s->db;
+	(void)depth;
+	const uint8_t *pg = page_at(db, pgno);
+	if (!pg) return -1;
+	/* Page 1 is unique: the 100-byte database header sits in front of its
+	 * b-tree header, but cell pointers are still offsets from the page start. */
+	uint32_t off = (pgno == 1) ? 100 : 0;
+	const uint8_t *h = pg + off;
+	uint8_t type = h[0];
+	if (type != 13) {
+		if (type == 5)
+			return err("page %u is a table interior page, which sqlr cannot read yet", pgno);
+		if (type == 2 || type == 10)
+			return err("page %u is an index b-tree page; sqlr reads table b-trees only", pgno);
+		return err("page %u has unknown b-tree page type %u", pgno, type);
+	}
+	uint32_t ncell = be16(h + 3);
+	uint32_t cellptr = off + 8;
+	if (cellptr + 2 * ncell > db->usable)
+		return err("page %u claims %u cells, which overruns the page", pgno, ncell);
+
+	for (uint32_t i = 0; i < ncell; i++) {
+		uint32_t co = be16(pg + cellptr + 2 * i);
+		if (co < cellptr + 2 * ncell || co >= db->usable)
+			return err("page %u cell %u offset %u outside the content area", pgno, i, co);
+		const uint8_t *c = pg + co;
+		const uint8_t *cend = pg + db->usable;
+
+		/* Leaf table cell: varint total payload length, varint rowid, then the
+		 * payload. */
+		uint64_t plen, rowid;
+		int k = varint(c, cend, &plen);
+		if (k < 0) return err("page %u cell %u: bad payload length varint", pgno, i);
+		c += k;
+		k = varint(c, cend, &rowid);
+		if (k < 0) return err("page %u cell %u: bad rowid varint", pgno, i);
+		c += k;
+		const uint8_t *pay;
+		if (payload_read(s, c, plen, (size_t)(cend - c), &pay) < 0) return -1;
+		if (fn(ctx, (int64_t)rowid, pay, (size_t)plen) < 0) return -1;
+	}
+	return 0;
+}
+
+static int scan_table(Scan *s, uint32_t root, RowFn fn, void *ctx) {
+	return walk(s, root, 0, fn, ctx);
+}
+
+/* ------------------------------------------------------- string helpers */
+
+static char *dupn(const uint8_t *p, size_t n) {
+	char *r = xmalloc(n + 1);
+	if (n) memcpy(r, p, n);
+	r[n] = 0;
+	return r;
+}
+
+/* ------------------------------------------------------------------- schema */
+
+typedef struct {
+	char *name;
+	char *sql;
+	uint32_t root;
+} Table;
+
+typedef struct {
+	Table *t;
+	int n, cap;
+	char **sql; /* every schema row's SQL text, in sqlite_schema order, for .schema */
+	int nsql, sqlcap;
+} Schema;
+
+/* Each sqlite_schema row is (type, name, tbl_name, rootpage, sql). */
+static int schema_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
+	Schema *sc = ctx;
+	Val v[MAXCOL];
+	int n;
+	(void)rowid;
+	if (rec_parse(pay, plen, v, &n) < 0) return -1;
+	if (n < 5) return err("sqlite_schema row has %d columns, expected 5", n);
+
+	if (v[4].t == V_TEXT) {
+		if (sc->nsql == sc->sqlcap) {
+			sc->sqlcap = sc->sqlcap ? sc->sqlcap * 2 : 16;
+			sc->sql = realloc(sc->sql, (size_t)sc->sqlcap * sizeof *sc->sql);
+			if (!sc->sql) exit(1);
+		}
+		sc->sql[sc->nsql++] = dupn(v[4].s, v[4].n);
+	}
+	if (v[0].t != V_TEXT || v[0].n != 5 || memcmp(v[0].s, "table", 5) != 0) return 0;
+	if (v[1].t != V_TEXT) return err("sqlite_schema row has a non-text name");
+	if (v[3].t != V_INT) return err("sqlite_schema row has a non-integer rootpage");
+	if (v[3].i <= 0) return 0; /* virtual table: no b-tree of its own */
+
+	if (sc->n == sc->cap) {
+		sc->cap = sc->cap ? sc->cap * 2 : 16;
+		sc->t = realloc(sc->t, (size_t)sc->cap * sizeof *sc->t);
+		if (!sc->t) exit(1);
+	}
+	Table *t = &sc->t[sc->n];
+	memset(t, 0, sizeof *t);
+	t->name = dupn(v[1].s, v[1].n);
+	t->root = (uint32_t)v[3].i;
+	t->sql = (v[4].t == V_TEXT) ? dupn(v[4].s, v[4].n) : NULL;
+	sc->n++;
+	return 0;
+}
+
+static int schema_load(Scan *s, Schema *sc) {
+	memset(sc, 0, sizeof *sc);
+	/* sqlite_schema is always rooted at page 1. */
+	return scan_table(s, 1, schema_row, sc);
+}
+
 /* ------------------------------------------------------------------- main */
 
+static int cmp_name(const void *a, const void *b) {
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 static int usage(void) {
-	fputs("usage: sqlr DB.sqlite .dbinfo\n", stderr);
+	fputs("usage: sqlr DB.sqlite {.dbinfo | .tables | .schema}\n", stderr);
 	return 2;
 }
 
@@ -139,10 +433,6 @@ int main(int argc, char **argv) {
 	if (db_open(&db, path) < 0) {
 		fprintf(stderr, "sqlr: %s\n", g_err);
 		return 1;
-	}
-	if (strcmp(cmd, ".dbinfo") != 0) {
-		free(db.d);
-		return usage();
 	}
 	if (!strcmp(cmd, ".dbinfo")) {
 		/* Everything here is a field of the 100-byte header, so this answers
@@ -158,4 +448,40 @@ int main(int argc, char **argv) {
 		free(db.d);
 		return fflush(stdout) == 0 ? 0 : 1;
 	}
+
+	Scan sc;
+	scan_init(&sc, &db);
+	Schema schema;
+	if (schema_load(&sc, &schema) < 0) {
+		fprintf(stderr, "sqlr: %s\n", g_err);
+		return 1;
+	}
+
+	int rc = 0;
+	if (!strcmp(cmd, ".tables")) {
+		/* sqlite3's .tables hides the internal sqlite_* tables and sorts. */
+		char **names = xmalloc((size_t)(schema.n ? schema.n : 1) * sizeof *names);
+		int k = 0;
+		for (int j = 0; j < schema.n; j++)
+			if (strncmp(schema.t[j].name, "sqlite_", 7) != 0) names[k++] = schema.t[j].name;
+		qsort(names, (size_t)k, sizeof *names, cmp_name);
+		for (int j = 0; j < k; j++) printf("%s\n", names[j]);
+		free(names);
+	} else if (!strcmp(cmd, ".schema")) {
+		/* In sqlite_schema order, each statement terminated with a semicolon,
+		 * which is what sqlite3's .schema emits. */
+		for (int j = 0; j < schema.nsql; j++) printf("%s;\n", schema.sql[j]);
+	} else {
+		fprintf(stderr, "sqlr: unsupported command: %s\n", cmd);
+		scan_free(&sc);
+		free(db.d);
+		return usage();
+	}
+	if (fflush(stdout) != 0) {
+		fprintf(stderr, "sqlr: write failed: %s\n", strerror(errno));
+		rc = 1;
+	}
+	scan_free(&sc);
+	free(db.d);
+	return rc;
 }
