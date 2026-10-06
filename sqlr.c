@@ -1082,6 +1082,16 @@ static int emit_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
 		v[i].t = V_NULL;
 	}
 	if (n > t->ncol) n = t->ncol;
+	/* A column with REAL affinity may hold an INTEGER serial type on disk:
+	 * SQLite stores a float whose value is an exact integer as the shortest
+	 * integer that fits, to save bytes, and converts it back to a float when
+	 * the column is read. Skipping this makes sqlr print 1 where sqlite3 prints
+	 * 1.0 -- the oracle caught exactly that. */
+	for (int i = 0; i < t->ncol; i++)
+		if (t->aff[i] == AFF_REAL && v[i].t == V_INT) {
+			v[i].t = V_REAL;
+			v[i].r = (double)v[i].i;
+		}
 	/* The INTEGER PRIMARY KEY column is stored as NULL; its value is the rowid. */
 	if (t->ipk >= 0 && t->ipk < t->ncol && v[t->ipk].t == V_NULL) {
 		v[t->ipk].t = V_INT;
