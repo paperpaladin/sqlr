@@ -8,7 +8,13 @@ all: sqlr
 sqlr: sqlr.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
+# The oracle. SQLite builds the databases and answers the queries; sqlr answers
+# the same queries; the bytes must match exactly.
+test: sqlr
+	./t/run.sh
+
 clean:
 	rm -f sqlr
+	rm -rf t/work
 
-.PHONY: all clean
+.PHONY: all test clean
