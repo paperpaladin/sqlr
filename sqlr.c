@@ -8,7 +8,7 @@
  *   sqlr DB.sqlite .dbinfo
  *   sqlr DB.sqlite .tables
  *   sqlr DB.sqlite .schema
- *   sqlr DB.sqlite 'SELECT a,b FROM t WHERE a = 1'
+ *   sqlr [--json] DB.sqlite 'SELECT a,b FROM t WHERE a = 1'
  *
  * Exit status: 0 ok, 1 error (bad file, bad query), 2 usage.
  */
@@ -735,6 +735,42 @@ static void put_tsv(FILE *f, const Val *v) {
 	}
 }
 
+static void put_json_str(FILE *f, const uint8_t *s, uint32_t n) {
+	fputc('"', f);
+	for (uint32_t i = 0; i < n; i++) {
+		uint8_t c = s[i];
+		switch (c) {
+		case '"': fputs("\\\"", f); break;
+		case '\\': fputs("\\\\", f); break;
+		case '\n': fputs("\\n", f); break;
+		case '\r': fputs("\\r", f); break;
+		case '\t': fputs("\\t", f); break;
+		case '\b': fputs("\\b", f); break;
+		case '\f': fputs("\\f", f); break;
+		default:
+			if (c < 0x20) fprintf(f, "\\u%04x", c);
+			else fputc(c, f);
+		}
+	}
+	fputc('"', f);
+}
+
+static void put_json(FILE *f, const Val *v) {
+	switch (v->t) {
+	case V_NULL: fputs("null", f); break;
+	case V_INT: fprintf(f, "%" PRId64, v->i); break;
+	case V_REAL: put_real(f, v->r); break; /* bare token; Inf is not legal JSON */
+	case V_TEXT: put_json_str(f, v->s, v->n); break;
+	case V_BLOB:
+		/* A single quote needs no escape in JSON, so the X'..' literal goes in
+		 * verbatim and the result is still valid JSON. */
+		fputc('"', f);
+		put_blob(f, v);
+		fputc('"', f);
+		break;
+	}
+}
+
 /* ------------------------------------------------------------- query parsing */
 
 typedef enum { OP_NONE, OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_ISNULL, OP_NOTNULL } Op;
@@ -1080,11 +1116,22 @@ static int emit_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
 		}
 	}
 
-	for (int i = 0; i < q->nsel; i++) {
-		if (i) fputc('\t', e->out);
-		put_tsv(e->out, q->selidx[i] < 0 ? &rid : &v[q->selidx[i]]);
+	if (e->json) {
+		fputs(e->nrows ? ",\n{" : "{", e->out);
+		for (int i = 0; i < q->nsel; i++) {
+			if (i) fputc(',', e->out);
+			put_json_str(e->out, (const uint8_t *)q->sel[i], (uint32_t)strlen(q->sel[i]));
+			fputc(':', e->out);
+			put_json(e->out, q->selidx[i] < 0 ? &rid : &v[q->selidx[i]]);
+		}
+		fputc('}', e->out);
+	} else {
+		for (int i = 0; i < q->nsel; i++) {
+			if (i) fputc('\t', e->out);
+			put_tsv(e->out, q->selidx[i] < 0 ? &rid : &v[q->selidx[i]]);
+		}
+		fputc('\n', e->out);
 	}
-	fputc('\n', e->out);
 	e->nrows++;
 	return 0;
 }
@@ -1096,13 +1143,19 @@ static int cmp_name(const void *a, const void *b) {
 }
 
 static int usage(void) {
-	fputs("usage: sqlr DB.sqlite {.dbinfo | .tables | .schema | SELECT ...}\n", stderr);
+	fputs("usage: sqlr [--json] DB.sqlite {.dbinfo | .tables | .schema | SELECT ...}\n", stderr);
 	return 2;
 }
 
 int main(int argc, char **argv) {
-	if (argc != 3) return usage();
-	const char *path = argv[1], *cmd = argv[2];
+	int json = 0, i = 1;
+	for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+		if (!strcmp(argv[i], "--json")) json = 1;
+		else if (!strcmp(argv[i], "--tsv")) json = 0;
+		else return usage();
+	}
+	if (argc - i != 2) return usage();
+	const char *path = argv[i], *cmd = argv[i + 1];
 
 	Db db;
 	if (db_open(&db, path) < 0) {
@@ -1153,12 +1206,16 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "sqlr: %s\n", g_err);
 			rc = 1;
 		} else {
-			Emit e = {&q, t, stdout, 0, AFF_BLOB, 0};
+			Emit e = {&q, t, stdout, json, AFF_BLOB, 0};
 			if (q.op != OP_NONE)
 				e.waff = (q.wcol < 0) ? AFF_INT : t->aff[q.wcol];
+			if (json) fputc('[', stdout);
 			if (scan_table(&sc, t->root, emit_row, &e) < 0) {
+				if (json) fputc('\n', stdout);
 				fprintf(stderr, "sqlr: %s\n", g_err);
 				rc = 1;
+			} else if (json) {
+				fputs("]\n", stdout);
 			}
 		}
 	}
