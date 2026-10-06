@@ -312,6 +312,31 @@ def build_corpus():
     q(db, "SELECT i FROM allt WHERE i != 7")
     q(db, "SELECT rowid, i FROM allt WHERE rowid = 3")
 
+    # 3. Overflow pages. The local-payload calculation has two branches (K and
+    #    M) and a threshold X; a sweep of value lengths across the boundary is
+    #    the only way to be sure both branches are right. Page size 512 puts the
+    #    boundary at a small, easily swept length.
+    for psize, lo, hi in ((512, 380, 1120), (1024, 900, 1400), (4096, 3980, 4200)):
+        db = make("ovf%d" % psize,
+                  "CREATE TABLE ov(n INTEGER, s TEXT, b BLOB);",
+                  [("INSERT INTO ov VALUES(?,?,?)",
+                    [(L, "a" * L, bytes([L & 0xFF]) * L) for L in range(lo, hi)])],
+                  page_size=psize)
+        q(db, "SELECT * FROM ov")
+        q(db, "SELECT n FROM ov WHERE n = %d" % (lo + 5))
+        q(db, "SELECT s FROM ov WHERE n = %d" % (hi - 1))
+
+    # A value spanning many overflow pages, and one spanning exactly a few.
+    db = make("ovlong", "CREATE TABLE big(k INTEGER, v TEXT, w BLOB);",
+              [("INSERT INTO big VALUES(?,?,?)",
+                [(1, "x" * 200000, b"\x00\xff" * 50000),
+                 (2, "y" * 509, b"z" * 1),
+                 (3, "é" * 30000, bytes(range(256)) * 200)])],
+              page_size=512)
+    q(db, "SELECT * FROM big")
+    q(db, "SELECT * FROM big", json=True)
+    q(db, "SELECT k FROM big WHERE k = 3")
+
     # 4. 50,000 rows: the table b-tree must grow interior pages, so a scan that
     #    only understands leaf pages returns a fraction of the rows.
     db = make("big50k",
