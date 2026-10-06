@@ -8,6 +8,7 @@
  *   sqlr DB.sqlite .dbinfo
  *   sqlr DB.sqlite .tables
  *   sqlr DB.sqlite .schema
+ *   sqlr DB.sqlite 'SELECT a,b FROM t WHERE a = 1'
  *
  * Exit status: 0 ok, 1 error (bad file, bad query), 2 usage.
  */
@@ -445,12 +446,47 @@ static char *dupn(const uint8_t *p, size_t n) {
 	return r;
 }
 
+static int ci_eq(const char *a, const char *b) {
+	for (; *a && *b; a++, b++)
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+	return *a == *b;
+}
+
+static char *upper_dup(const char *s) {
+	char *r = xmalloc(strlen(s) + 1);
+	for (size_t i = 0; s[i]; i++) r[i] = (char)toupper((unsigned char)s[i]);
+	r[strlen(s)] = 0;
+	return r;
+}
+
+/* ----------------------------------------------------------- type affinity */
+
+typedef enum { AFF_BLOB, AFF_TEXT, AFF_NUM, AFF_INT, AFF_REAL } Aff;
+
+/* The declared-type to affinity rules, in the order the spec applies them. */
+static Aff affinity(const char *ty) {
+	char *u = upper_dup(ty ? ty : "");
+	Aff a;
+	if (strstr(u, "INT")) a = AFF_INT;
+	else if (strstr(u, "CHAR") || strstr(u, "CLOB") || strstr(u, "TEXT")) a = AFF_TEXT;
+	else if (strstr(u, "BLOB") || !*u) a = AFF_BLOB;
+	else if (strstr(u, "REAL") || strstr(u, "FLOA") || strstr(u, "DOUB")) a = AFF_REAL;
+	else a = AFF_NUM;
+	free(u);
+	return a;
+}
+
 /* ------------------------------------------------------------------- schema */
 
 typedef struct {
 	char *name;
 	char *sql;
 	uint32_t root;
+	int ncol;
+	char *col[MAXCOL];
+	char *type[MAXCOL];
+	Aff aff[MAXCOL];
+	int ipk; /* index of the INTEGER PRIMARY KEY column, or -1 */
 } Table;
 
 typedef struct {
@@ -459,6 +495,146 @@ typedef struct {
 	char **sql; /* every schema row's SQL text, in sqlite_schema order, for .schema */
 	int nsql, sqlcap;
 } Schema;
+
+/* Pull one identifier off `*pp`, handling "quoted", [bracketed], `backticked`
+ * and bare names. */
+static char *ident(const char **pp) {
+	const char *p = *pp;
+	while (*p && isspace((unsigned char)*p)) p++;
+	char close = 0;
+	if (*p == '"') close = '"';
+	else if (*p == '`') close = '`';
+	else if (*p == '[') close = ']';
+	if (close) {
+		p++;
+		char *out = xmalloc(strlen(p) + 1);
+		size_t k = 0;
+		while (*p) {
+			if (*p == close) {
+				if (close != ']' && p[1] == close) { out[k++] = *p; p += 2; continue; }
+				p++;
+				break;
+			}
+			out[k++] = *p++;
+		}
+		out[k] = 0;
+		*pp = p;
+		return out;
+	}
+	const char *st = p;
+	while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '$')) p++;
+	if (p == st) return NULL;
+	char *out = dupn((const uint8_t *)st, (size_t)(p - st));
+	*pp = p;
+	return out;
+}
+
+/* Parse the column list out of a CREATE TABLE statement.
+ *
+ * shortcut: this is a shape-matcher, not an SQL parser. It finds the outermost
+ * parenthesised list, splits it on top-level commas, takes the first token of
+ * each part as a column name and the run of bare words after it as the declared
+ * type, and skips parts that begin with a table-constraint keyword. That covers
+ * everything sqlite3 emits for ordinary CREATE TABLE. Upgrade path: a real
+ * tokeniser; the ceiling today is exotic DDL (expressions in DEFAULT that
+ * contain unbalanced quotes, generated columns). */
+static int parse_create(Table *t, const char *sql) {
+	const char *p = strchr(sql, '(');
+	if (!p) return err("table %s: CREATE statement has no column list", t->name);
+	p++;
+	int depth = 0;
+	const char *part = p;
+	for (;; p++) {
+		if (*p == '\'' || *p == '"' || *p == '`') {
+			char qc = *p++;
+			while (*p && *p != qc) p++;
+			if (!*p) return err("table %s: unterminated quote in CREATE", t->name);
+			continue;
+		}
+		if (*p == '(') depth++;
+		else if (*p == ')' && depth > 0) depth--;
+		if (*p == 0 || (depth == 0 && (*p == ',' || *p == ')'))) {
+			/* [part, p) is one column-def or table-constraint */
+			char *frag = dupn((const uint8_t *)part, (size_t)(p - part));
+			const char *q = frag;
+			char *nm = ident(&q);
+			if (nm) {
+				char *u = upper_dup(nm);
+				int is_constraint = !strcmp(u, "PRIMARY") || !strcmp(u, "UNIQUE") ||
+				                    !strcmp(u, "CHECK") || !strcmp(u, "FOREIGN") ||
+				                    !strcmp(u, "CONSTRAINT");
+				free(u);
+				if (is_constraint) {
+					free(nm);
+				} else if (t->ncol >= MAXCOL) {
+					free(nm);
+					free(frag);
+					return err("table %s: more than %d columns", t->name, MAXCOL);
+				} else {
+					/* Declared type is the words up to the first keyword that
+					 * starts a constraint, or '(' of a type like VARCHAR(10). */
+					while (*q && isspace((unsigned char)*q)) q++;
+					const char *ts = q;
+					while (*q && (isalnum((unsigned char)*q) || *q == '_' || *q == ' ' ||
+					              *q == '(' || *q == ')' || *q == ',')) {
+						/* stop at a constraint keyword */
+						if (isalpha((unsigned char)*q)) {
+							const char *w = q;
+							while (*q && isalnum((unsigned char)*q)) q++;
+							size_t wl = (size_t)(q - w);
+							static const char *stop[] = {"PRIMARY", "NOT", "NULL", "UNIQUE",
+							                             "CHECK", "DEFAULT", "COLLATE",
+							                             "REFERENCES", "GENERATED", "AS", 0};
+							char wu[32];
+							if (wl < sizeof wu) {
+								for (size_t i = 0; i < wl; i++) wu[i] = (char)toupper((unsigned char)w[i]);
+								wu[wl] = 0;
+								int st2 = 0;
+								for (int i = 0; stop[i]; i++) if (!strcmp(wu, stop[i])) st2 = 1;
+								if (st2) { q = w; break; }
+							}
+							continue;
+						}
+						q++;
+					}
+					size_t tl = (size_t)(q - ts);
+					while (tl && isspace((unsigned char)ts[tl - 1])) tl--;
+					char *ty = dupn((const uint8_t *)ts, tl);
+
+					/* An INTEGER PRIMARY KEY column on a rowid table is an
+					 * alias for the rowid itself: the record stores NULL there
+					 * and the real value is the cell's rowid. Only the exact
+					 * type name "INTEGER" qualifies -- "INT PRIMARY KEY" does
+					 * not -- and "DESC" disqualifies it. */
+					char *tu = upper_dup(ty);
+					char *ru = upper_dup(q);
+					if (!strcmp(tu, "INTEGER") && strstr(ru, "PRIMARY KEY") && !strstr(ru, "DESC"))
+						t->ipk = t->ncol;
+					free(tu);
+					free(ru);
+
+					t->col[t->ncol] = nm;
+					t->type[t->ncol] = ty;
+					t->aff[t->ncol] = affinity(ty);
+					t->ncol++;
+				}
+			}
+			free(frag);
+			if (*p == 0 || *p == ')') break;
+			part = p + 1;
+		}
+	}
+	if (t->ncol == 0) return err("table %s: no columns found", t->name);
+	/* shortcut: WITHOUT ROWID tables are index b-trees, which this parser does
+	 * not read. Refuse loudly rather than print wrong rows. */
+	char *tail = upper_dup(p);
+	if (strstr(tail, "WITHOUT ROWID")) {
+		free(tail);
+		return err("table %s is WITHOUT ROWID; sqlr reads rowid tables only", t->name);
+	}
+	free(tail);
+	return 0;
+}
 
 /* Each sqlite_schema row is (type, name, tbl_name, rootpage, sql). */
 static int schema_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
@@ -491,6 +667,7 @@ static int schema_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen)
 	memset(t, 0, sizeof *t);
 	t->name = dupn(v[1].s, v[1].n);
 	t->root = (uint32_t)v[3].i;
+	t->ipk = -1;
 	t->sql = (v[4].t == V_TEXT) ? dupn(v[4].s, v[4].n) : NULL;
 	sc->n++;
 	return 0;
@@ -502,6 +679,200 @@ static int schema_load(Scan *s, Schema *sc) {
 	return scan_table(s, 1, schema_row, sc);
 }
 
+static Table *table_find(Schema *sc, const char *name) {
+	for (int i = 0; i < sc->n; i++)
+		if (ci_eq(sc->t[i].name, name)) return &sc->t[i];
+	return NULL;
+}
+
+/* ------------------------------------------------------------------ output */
+
+/* SQLite renders a REAL with %.15g and then makes sure the result cannot be
+ * mistaken for an integer: if the mantissa has no '.', one is inserted. That is
+ * why sqlite3 prints 1.0 and 1.0e+300 rather than 1 and 1e+300. Matching it
+ * exactly is required for byte-identical output. */
+static void put_real(FILE *f, double d) {
+	if (isnan(d)) { fputs("", f); return; } /* SQLite stores NaN as NULL */
+	if (isinf(d)) { fputs(d < 0 ? "-Inf" : "Inf", f); return; }
+	char b[64];
+	if (d == 0.0) { fputs("0.0", f); return; } /* also normalises -0.0 */
+	snprintf(b, sizeof b, "%.15g", d);
+	if (!strchr(b, '.')) {
+		char *e = strpbrk(b, "eE");
+		if (!e) {
+			strncat(b, ".0", sizeof b - strlen(b) - 1);
+		} else {
+			char tail[64];
+			snprintf(tail, sizeof tail, "%s", e);
+			size_t cut = (size_t)(e - b);
+			snprintf(b + cut, sizeof b - cut, ".0%s", tail);
+		}
+	}
+	fputs(b, f);
+}
+
+static const char hexd[] = "0123456789ABCDEF";
+
+static void put_blob(FILE *f, const Val *v) {
+	/* shortcut: blobs render as SQLite's own X'..' literal syntax, in both TSV
+	 * and JSON. It is lossless and unambiguous for a blob, at the cost of being
+	 * indistinguishable from a text value that happens to spell X'41'. */
+	fputs("X'", f);
+	for (uint32_t i = 0; i < v->n; i++) {
+		fputc(hexd[v->s[i] >> 4], f);
+		fputc(hexd[v->s[i] & 15], f);
+	}
+	fputc('\'', f);
+}
+
+static void put_tsv(FILE *f, const Val *v) {
+	switch (v->t) {
+	case V_NULL: break; /* empty field, like sqlite3's default nullvalue */
+	case V_INT: fprintf(f, "%" PRId64, v->i); break;
+	case V_REAL: put_real(f, v->r); break;
+	case V_TEXT: fwrite(v->s, 1, v->n, f); break;
+	case V_BLOB: put_blob(f, v); break;
+	}
+}
+
+/* ------------------------------------------------------------- query parsing */
+
+typedef enum { OP_NONE, OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_ISNULL, OP_NOTNULL } Op;
+
+typedef struct {
+	char *table;
+	int star;
+	int nsel;
+	char *sel[MAXCOL];
+	int selidx[MAXCOL]; /* column index, or -1 meaning "the rowid" */
+	Op op;
+	int wcol; /* -1 means rowid */
+	Val wval;
+	uint8_t *wbuf; /* owns wval's bytes */
+} Query;
+
+static void skipws(const char **p) {
+	while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+static int word(const char **p, const char *kw) {
+	const char *q = *p;
+	skipws(&q);
+	size_t n = strlen(kw);
+	for (size_t i = 0; i < n; i++)
+		if (tolower((unsigned char)q[i]) != tolower((unsigned char)kw[i])) return 0;
+	if (isalnum((unsigned char)q[n]) || q[n] == '_') return 0;
+	*p = q + n;
+	return 1;
+}
+
+static int col_index(Table *t, const char *name) {
+	for (int i = 0; i < t->ncol; i++)
+		if (ci_eq(t->col[i], name)) return i;
+	if (ci_eq(name, "rowid") || ci_eq(name, "_rowid_") || ci_eq(name, "oid")) return -1;
+	return -2;
+}
+
+/* shortcut: this recognises exactly
+ *   SELECT <*|col,...> FROM <table> [WHERE <col> <op> <literal> | <col> IS [NOT] NULL]
+ * and nothing else -- no joins, no ORDER BY, no LIMIT, no expressions, no
+ * aggregates, no OR/AND. Upgrade path is a real tokeniser plus an expression
+ * tree with an eval() over Val; the scan loop below already has the right shape
+ * for it (one predicate call per row). */
+static int query_parse(Query *q, Schema *sc, const char *sql, Table **tout) {
+	memset(q, 0, sizeof *q);
+	q->op = OP_NONE;
+	const char *p = sql;
+	if (!word(&p, "select")) return err("only SELECT is supported");
+
+	/* Column list: remember the names now, resolve them once we know the table. */
+	skipws(&p);
+	if (*p == '*') { q->star = 1; p++; }
+	else {
+		for (;;) {
+			char *nm = ident(&p);
+			if (!nm) return err("expected a column name in the select list");
+			if (q->nsel >= MAXCOL) { free(nm); return err("too many columns selected"); }
+			q->sel[q->nsel++] = nm;
+			skipws(&p);
+			if (*p == ',') { p++; continue; }
+			break;
+		}
+	}
+	if (!word(&p, "from")) return err("expected FROM");
+	q->table = ident(&p);
+	if (!q->table) return err("expected a table name after FROM");
+
+	Table *t = table_find(sc, q->table);
+	if (!t) return err("no such table: %s", q->table);
+	if (!t->sql) return err("table %s has no CREATE statement in sqlite_schema", q->table);
+	if (t->ncol == 0 && parse_create(t, t->sql) < 0) return -1;
+	*tout = t;
+
+	if (q->star) {
+		q->nsel = t->ncol;
+		for (int i = 0; i < t->ncol; i++) {
+			q->sel[i] = dupn((const uint8_t *)t->col[i], strlen(t->col[i]));
+			q->selidx[i] = i;
+		}
+	} else {
+		for (int i = 0; i < q->nsel; i++) {
+			int ix = col_index(t, q->sel[i]);
+			if (ix == -2) return err("no such column: %s", q->sel[i]);
+			q->selidx[i] = ix;
+		}
+	}
+
+	skipws(&p);
+	if (*p == ';') { p++; skipws(&p); }
+	if (*p) return err("unexpected trailing input: %s", p);
+	return 0;
+}
+
+/* --------------------------------------------------------------- the scan */
+
+typedef struct {
+	Query *q;
+	Table *t;
+	FILE *out;
+	int json;
+	Aff waff;
+	long long nrows;
+} Emit;
+
+static int emit_row(void *ctx, int64_t rowid, const uint8_t *pay, size_t plen) {
+	Emit *e = ctx;
+	Query *q = e->q;
+	Table *t = e->t;
+	Val v[MAXCOL];
+	int n;
+	if (rec_parse(pay, plen, v, &n) < 0) return -1;
+
+	/* A row written before an ALTER TABLE ADD COLUMN has fewer values than the
+	 * table has columns; the missing trailing ones read as NULL.
+	 * shortcut: a column added with a non-NULL DEFAULT would need that default
+	 * from the CREATE statement; we always use NULL. */
+	for (int i = n; i < t->ncol; i++) {
+		memset(&v[i], 0, sizeof v[i]);
+		v[i].t = V_NULL;
+	}
+	if (n > t->ncol) n = t->ncol;
+	/* The INTEGER PRIMARY KEY column is stored as NULL; its value is the rowid. */
+	if (t->ipk >= 0 && t->ipk < t->ncol && v[t->ipk].t == V_NULL) {
+		v[t->ipk].t = V_INT;
+		v[t->ipk].i = rowid;
+	}
+	Val rid = {V_INT, rowid, 0, NULL, 0};
+
+	for (int i = 0; i < q->nsel; i++) {
+		if (i) fputc('\t', e->out);
+		put_tsv(e->out, q->selidx[i] < 0 ? &rid : &v[q->selidx[i]]);
+	}
+	fputc('\n', e->out);
+	e->nrows++;
+	return 0;
+}
+
 /* ------------------------------------------------------------------- main */
 
 static int cmp_name(const void *a, const void *b) {
@@ -509,7 +880,7 @@ static int cmp_name(const void *a, const void *b) {
 }
 
 static int usage(void) {
-	fputs("usage: sqlr DB.sqlite {.dbinfo | .tables | .schema}\n", stderr);
+	fputs("usage: sqlr DB.sqlite {.dbinfo | .tables | .schema | SELECT ...}\n", stderr);
 	return 2;
 }
 
@@ -560,10 +931,20 @@ int main(int argc, char **argv) {
 		 * which is what sqlite3's .schema emits. */
 		for (int j = 0; j < schema.nsql; j++) printf("%s;\n", schema.sql[j]);
 	} else {
-		fprintf(stderr, "sqlr: unsupported command: %s\n", cmd);
-		scan_free(&sc);
-		free(db.d);
-		return usage();
+		Query q;
+		Table *t = NULL;
+		if (query_parse(&q, &schema, cmd, &t) < 0) {
+			fprintf(stderr, "sqlr: %s\n", g_err);
+			rc = 1;
+		} else {
+			Emit e = {&q, t, stdout, 0, AFF_BLOB, 0};
+			if (q.op != OP_NONE)
+				e.waff = (q.wcol < 0) ? AFF_INT : t->aff[q.wcol];
+			if (scan_table(&sc, t->root, emit_row, &e) < 0) {
+				fprintf(stderr, "sqlr: %s\n", g_err);
+				rc = 1;
+			}
+		}
 	}
 	if (fflush(stdout) != 0) {
 		fprintf(stderr, "sqlr: write failed: %s\n", strerror(errno));
