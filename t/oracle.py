@@ -427,6 +427,24 @@ def build_corpus():
     q(db, "SELECT * FROM ix")
     q(db, "SELECT * FROM ix WHERE k = 'a'")
 
+    # 9. Identifiers and declared types that stress the CREATE-statement
+    #    shape-matcher: quoted names, a comma inside a type, table constraints
+    #    that are not columns, DEFAULT values containing parentheses.
+    db = make("ddl", """
+        CREATE TABLE "odd name"(
+            "a b" VARCHAR(10,2) NOT NULL DEFAULT 'x,y)',
+            [brack] INTEGER DEFAULT 0,
+            `tick` REAL,
+            plain,
+            CHECK ("a b" <> ''),
+            UNIQUE([brack])
+        );
+        INSERT INTO "odd name" VALUES('hi', 5, 1.5, NULL);
+    """)
+    meta(db, ".schema")
+    q(db, 'SELECT * FROM "odd name"')
+    q(db, 'SELECT "a b", [brack], `tick` FROM "odd name"')
+
     # 10. Affinity in the WHERE clause: comparing a text literal against an
     #     INTEGER column and a numeric literal against a TEXT column is where
     #     SQLite's conversion rules bite.
