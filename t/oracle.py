@@ -312,6 +312,34 @@ def build_corpus():
     q(db, "SELECT i FROM allt WHERE i != 7")
     q(db, "SELECT rowid, i FROM allt WHERE rowid = 3")
 
+    # 4. 50,000 rows: the table b-tree must grow interior pages, so a scan that
+    #    only understands leaf pages returns a fraction of the rows.
+    db = make("big50k",
+              "CREATE TABLE r(id INTEGER PRIMARY KEY, k INTEGER, s TEXT, f REAL);",
+              [("INSERT INTO r VALUES(?,?,?,?)",
+                [(i, i * 7 % 50021, "row-%06d" % i, i / 16.0) for i in range(1, 50001)])])
+    q(db, "SELECT * FROM r")
+    q(db, "SELECT id FROM r WHERE id = 49999")
+    q(db, "SELECT id, s FROM r WHERE k = 0")
+    q(db, "SELECT id FROM r WHERE s = 'row-025000'")
+    q(db, "SELECT id, f FROM r WHERE id > 49995")
+    meta(db, ".tables")
+
+    # 4b. The same row count on 512-byte pages: ~3,300 leaf pages need more
+    #     interior cells than one interior page holds, so the tree grows a third
+    #     level and an interior page points at another interior page. A walker
+    #     that only handles one level of indirection stops here.
+    db = make("deep",
+              "CREATE TABLE d(id INTEGER PRIMARY KEY, s TEXT);",
+              [("INSERT INTO d VALUES(?,?)",
+                [(i, "deep-row-%06d-padding" % i) for i in range(1, 50001)])],
+              page_size=512)
+    q(db, "SELECT * FROM d")
+    q(db, "SELECT id FROM d WHERE id = 50000")
+    q(db, "SELECT s FROM d WHERE s = 'deep-row-033333-padding'")
+    q(db, "SELECT id FROM d WHERE id > 49998")
+    meta(db, ".dbinfo")
+
     return WORK
 
 
