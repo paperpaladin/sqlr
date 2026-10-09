@@ -23,7 +23,12 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SQLR = os.environ.get("SQLR", os.path.join(ROOT, "sqlr"))
-WORK = os.path.join(HERE, "work")
+# The pid is in the path because two runs of this suite at once used to
+# share t/work, and the first thing each does is delete it -- so the slower
+# run had its databases removed out from under it mid-comparison. Hit for
+# real: two instances of .portfolio/extract.py overlapped, and the repos with
+# fixed scratch paths reported failures they do not have.
+WORK = os.path.join(HERE, "work.%d" % os.getpid())
 
 agree = 0
 disagree = 0
@@ -674,16 +679,24 @@ def main():
         shutil.rmtree(WORK)
     os.makedirs(WORK)
 
-    print("building corpus with SQLite %s ..." % sqlite3.sqlite_version)
-    build_corpus()
-    n = len(os.listdir(WORK))
-    print("%d databases, %d comparison cases" % (n, len(CASES)))
+    # try/finally rather than a tidy-up at the end: the corpus is several
+    # megabytes of databases, and a suite that only cleans up when it passes
+    # leaves them behind forever, because the next green run never looks. That
+    # is how three sibling repos acquired permanent scratch directories, one of
+    # which made a different tool unusable.
+    try:
+        print("building corpus with SQLite %s ..." % sqlite3.sqlite_version)
+        build_corpus()
+        n = len(os.listdir(WORK))
+        print("%d databases, %d comparison cases" % (n, len(CASES)))
 
-    compare_cases()
-    refusals()
-    readonly_check()
-    print("robustness: truncating and corrupting ...")
-    robustness()
+        compare_cases()
+        refusals()
+        readonly_check()
+        print("robustness: truncating and corrupting ...")
+        robustness()
+    finally:
+        shutil.rmtree(WORK, ignore_errors=True)
 
     if failures:
         print("\nFAILURES:")

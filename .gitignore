@@ -1,6 +1,6 @@
 sqlr
 sqlr-asan
-t/work/
+t/work*
 *.o
 *.db
 *.db-journal

@@ -29,6 +29,6 @@ sqlr-asan: sqlr.c
 
 clean:
 	rm -f sqlr sqlr-asan
-	rm -rf t/work
+	rm -rf t/work*
 
 .PHONY: all test test-asan clean
