@@ -40,22 +40,22 @@ rm -rf t/work
 cc -std=c11 -O2 -Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion -o sqlr sqlr.c -lm
 ./t/run.sh
 building corpus with SQLite 3.46.1 ...
-20 databases, 89 comparison cases
+21 databases, 97 comparison cases
 robustness: truncating and corrupting ...
 
-114 agree, 0 disagree
+123 agree, 0 disagree
 ```
 
-About 13 seconds. `make test-asan` runs the identical harness against a build
+About 17 seconds. `make test-asan` runs the identical harness against a build
 with `-fsanitize=address,undefined` and takes about a minute:
 
 ```
 $ make test-asan
 ...
-20 databases, 89 comparison cases
+21 databases, 97 comparison cases
 robustness: truncating and corrupting ...
 
-114 agree, 0 disagree
+123 agree, 0 disagree
 ```
 
 ## Why this exists
