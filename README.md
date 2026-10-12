@@ -115,7 +115,8 @@ The corpus covers, deliberately, the cases that break naive parsers:
 
 | what | why it breaks parsers |
 | --- | --- |
-| every `.dbinfo` field against the PRAGMA that reports the same number | the 100-byte header, checked field by field |
+| six of the seven `.dbinfo` fields against the PRAGMA that reports the same number, and `reserved_bytes` against byte 20 of the file, since no PRAGMA reads it back | the 100-byte header, checked field by field |
+| 32 reserved bytes per page, on 512-byte pages, with values long enough to overflow | reserved bytes shrink the usable page, so every overflow threshold and the end of the cell content area move with them |
 | 300 tables on 512-byte pages | `sqlite_schema` itself outgrows one page, so `.tables` needs the interior-page walk |
 | one CREATE statement over 5 KB | `sqlite_schema`'s own record spills to an overflow page, so `.schema` needs the chain reader |
 | a table with 0 rows | a leaf page with no cell pointer array |
@@ -130,7 +131,7 @@ The corpus covers, deliberately, the cases that break naive parsers:
 | text and blob lengths swept one byte at a time across the overflow threshold, at page sizes 512, 1024 and 4096 | the `X`/`M`/`K` branch in the local-payload calculation |
 | a 200 KB value on 512-byte pages | a ~400-page overflow chain |
 | 50,000 rows on 4 KiB pages | interior pages exist at all |
-| **50,000 rows on 512-byte pages: a 4-level b-tree, 3,266 leaf and 66 interior pages** | an interior page whose children are also interior pages |
+| **50,000 rows on 512-byte pages: a 4-level b-tree, 3,266 leaf and 66 interior pages** (asserted against SQLite's `dbstat`, not just described) | an interior page whose children are also interior pages |
 | rowids made non-contiguous by DELETE, plus negative and far-apart rowids | rowid is not the row's position |
 | a table with no INTEGER PRIMARY KEY | the rowid is not in the record at all |
 | `ALTER TABLE ADD COLUMN`, so old rows have short records | missing trailing columns read as NULL |
@@ -142,9 +143,15 @@ The corpus covers, deliberately, the cases that break naive parsers:
 And the robustness half, where the claim is "does not misbehave" rather than
 "matches SQLite", because SQLite's behaviour on a corrupt file is not a spec:
 
-- three valid databases truncated at **every page boundary and one byte either
-  side**, plus a spread of other offsets -- including a 512-byte-page file that is
-  mostly one overflow chain, and the 4-level b-tree;
+- three valid databases truncated at up to 1,400 offsets each, chosen as
+  **every page boundary and one byte either side** plus every offset inside the
+  100-byte header -- including a 512-byte-page file that is mostly one overflow
+  chain, and the 4-level b-tree. The small fixture gets every candidate offset;
+  the two large ones generate more candidates than the budget (deep.db offers
+  10,274), so they get an even sample of them **spread across the whole file**.
+  That spread is the point: the budget used to be spent on the lowest offsets,
+  which reached 13% of deep.db and 49% of the overflow-chain file, so neither
+  sweep ever cut the interior pages or the chain tail it existed for;
 - 500 single-byte corruptions through the first pages, where page types, cell
   counts, cell pointers and varints live;
 - hand-built hostile files: empty, 16 bytes, header-only, bad magic, zero and
