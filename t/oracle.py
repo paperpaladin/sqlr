@@ -212,6 +212,19 @@ def seed_reserve_bytes(path, n):
     can carry on appending to the file afterwards.
     """
     lib = ctypes.CDLL(ctypes.util.find_library("sqlite3") or "libsqlite3.so.0")
+    # The rest of the corpus is written by Python's sqlite3 module, and this
+    # one file is started by a libsqlite3 loaded separately. On this machine
+    # they are the same 3.46.1, but a Python linked against a different
+    # SQLite would have two versions writing one fixture -- which breaks the
+    # "SQLite is the only thing that writes" rule in a way that is hard to
+    # see, since both halves are still SQLite.
+    lib.sqlite3_libversion.restype = ctypes.c_char_p
+    ctypes_ver = lib.sqlite3_libversion().decode()
+    if ctypes_ver != sqlite3.sqlite_version:
+        raise RuntimeError(
+            "libsqlite3 via ctypes is %s but Python's module is %s; one "
+            "fixture would be written by two different SQLites"
+            % (ctypes_ver, sqlite3.sqlite_version))
     db = ctypes.c_void_p()
     if lib.sqlite3_open(path.encode(), ctypes.byref(db)) != 0:
         raise RuntimeError("sqlite3_open failed for %s" % path)
