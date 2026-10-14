@@ -64,7 +64,7 @@ The SQLite file format is a short, stable, extremely well specified thing that
 sits under a few billion devices, and reading it is a good way to find out
 whether you actually understand it. Writing a parser also gives you something
 useful: a way to pull rows out of a database file with no SQLite available, no
-lock taken, and no possibility of modifying the file, which is exactly the
+lock taken, and no possibility of modifying the file, exactly the
 situation you are in when the file is evidence, a backup, or something you found.
 
 The interesting part is not the b-tree. It is the handful of rules that are
@@ -105,7 +105,7 @@ SQLite's own `CAST(x AS TEXT)` and a BLOB's hex from SQLite's own `hex()`. If
 One honest deviation from the brief: the `sqlite3` command-line shell is not
 installed in this environment (`sqlite3: command not found`. No package may be
 installed). SQLite is therefore reached through python3's stdlib `sqlite3`
-module, which is a binding to the same libsqlite3, version 3.46.1. The engine
+module, a binding to the same libsqlite3, version 3.46.1. The engine
 and the authority are identical; only the front end differs. The practical cost
 is that output formats cannot be inherited from the shell's `.mode tabs` and
 `.mode json`, so `sqlr` defines them (see PLAN.md, "Contract") and the harness
@@ -157,7 +157,7 @@ not "matches SQLite", because SQLite's behaviour on a corrupt file is not a spec
 - hand-built hostile files: empty, 16 bytes, header-only, bad magic, zero and
   non-power-of-two page sizes, a UTF-16 encoding flag, a page count of 2^31-1,
   illegal payload fractions, all-zero pages, and **a b-tree root that is its own
-  child** (caught by the visited-page bitmap, which is why a cyclic file
+  child** (caught by the visited-page bitmap, so a cyclic file
   terminates instead of looping);
 - a check that the database file's SHA-256 is unchanged after reading it and that
   no `-journal`/`-wal`/`-shm` sidecar appeared;
@@ -187,7 +187,7 @@ What does not work: the honest list:
   prints every `sqlite_schema` row's SQL, but you cannot query them.
 - No UTF-16 databases. Rejected at open time.
 - No `COLLATE`. Text comparison is `memcmp`, i.e. BINARY. A column declared
-  `COLLATE NOCASE` will compare case-sensitively, which is a wrong answer; the
+  `COLLATE NOCASE` will compare case-sensitively, and that is a wrong answer; the
   corpus does not use one.
 - No column DEFAULT values. A column added by `ALTER TABLE ADD COLUMN ... 
   DEFAULT 5` reads as NULL in rows written before the ALTER, where SQLite reads
