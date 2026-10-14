@@ -1,8 +1,8 @@
 # sqlr
 
 A read-only SQLite 3 database file parser in one C file: it reads the on-disk
-format directly -- header, b-tree pages, overflow chains, records, `sqlite_schema`
--- and answers `SELECT ... FROM table [WHERE col = value]` by full table scan,
+format directly, header, b-tree pages, overflow chains, records, `sqlite_schema`,
+and answers `SELECT ... FROM table [WHERE col = value]` by full table scan,
 without linking libsqlite3.
 
 ```
@@ -64,7 +64,7 @@ The SQLite file format is a short, stable, extremely well specified thing that
 sits under a few billion devices, and reading it is a good way to find out
 whether you actually understand it. Writing a parser also gives you something
 useful: a way to pull rows out of a database file with no SQLite available, no
-lock taken, and no possibility of modifying the file -- which is exactly the
+lock taken, and no possibility of modifying the file, which is exactly the
 situation you are in when the file is evidence, a backup, or something you found.
 
 The interesting part is not the b-tree. It is the handful of rules that are
@@ -81,9 +81,9 @@ wrong:
   fits". It is one of two computed values, `M` or `K`, picked so that the last
   overflow page comes out as full as possible. `local_payload()` in `sqlr.c`
   spells out the arithmetic.
-- An `INTEGER PRIMARY KEY` column is stored as NULL; its value is the cell's
+- An `INTEGER PRIMARY KEY` column is stored as NULL. Its value is the cell's
   rowid.
-- A column with REAL affinity may hold an **integer** serial type, because
+- A column with REAL affinity may hold an integer serial type, because
   SQLite shrinks a float whose value is an exact integer and re-floats it on
   read. Nothing in the record says the value was ever a float.
 
@@ -92,20 +92,20 @@ the spec more carefully.
 
 ## The oracle
 
-**SQLite is the authority and the comparison is exact.** SQLite creates every
-database in the corpus and inserts every row; each query is then answered twice,
+SQLite is the authority and the comparison is exact. SQLite creates every
+database in the corpus and inserts every row. Each query is then answered twice,
 once by SQLite and once by `sqlr`, and the two byte strings must be equal.
 `t/run.sh` prints `N agree, M disagree` and exits nonzero if anything disagrees.
 
-The harness pushes every formatting decision back into SQLite rather than
-reimplementing it, so the comparison stays a real test: a REAL's text comes from
+The harness pushes every formatting decision back into SQLite,
+not reimplementing it, so the comparison stays a real test: a REAL's text comes from
 SQLite's own `CAST(x AS TEXT)` and a BLOB's hex from SQLite's own `hex()`. If
-`put_real()` in `sqlr.c` renders `1.0` as `1`, the oracle says so -- and it did.
+`put_real()` in `sqlr.c` renders `1.0` as `1`, the oracle says so, and it did.
 
-**One honest deviation from the brief:** the `sqlite3` command-line shell is not
-installed in this environment (`sqlite3: command not found`; no package may be
+One honest deviation from the brief: the `sqlite3` command-line shell is not
+installed in this environment (`sqlite3: command not found`. No package may be
 installed). SQLite is therefore reached through python3's stdlib `sqlite3`
-module, which is a binding to the same libsqlite3 -- version 3.46.1. The engine
+module, which is a binding to the same libsqlite3, version 3.46.1. The engine
 and the authority are identical; only the front end differs. The practical cost
 is that output formats cannot be inherited from the shell's `.mode tabs` and
 `.mode json`, so `sqlr` defines them (see PLAN.md, "Contract") and the harness
@@ -140,12 +140,12 @@ The corpus covers, deliberately, the cases that break naive parsers:
 | quoted, bracketed and backticked identifiers; `VARCHAR(10,2)`; a `DEFAULT 'x,y)'`; table-level CHECK and UNIQUE | the CREATE-statement column splitter |
 | text vs numeric literals in `WHERE` | SQLite's type-affinity conversion rules |
 
-And the robustness half, where the claim is "does not misbehave" rather than
-"matches SQLite", because SQLite's behaviour on a corrupt file is not a spec:
+And the robustness half, where the claim is "does not misbehave",
+not "matches SQLite", because SQLite's behaviour on a corrupt file is not a spec:
 
 - three valid databases truncated at up to 1,400 offsets each, chosen as
-  **every page boundary and one byte either side** plus every offset inside the
-  100-byte header -- including a 512-byte-page file that is mostly one overflow
+  every page boundary and one byte either side plus every offset inside the
+  100-byte header, including a 512-byte-page file that is mostly one overflow
   chain, and the 4-level b-tree. The small fixture gets every candidate offset;
   the two large ones generate more candidates than the budget (deep.db offers
   10,274), so they get an even sample of them **spread across the whole file**.
@@ -167,43 +167,43 @@ And the robustness half, where the claim is "does not misbehave" rather than
 
 Works, and is checked against SQLite on every run.
 
-**What does not work -- the honest list:**
+What does not work: the honest list:
 
-- **No indexes.** Index b-tree pages (types 2 and 10) are *refused with an
+- No indexes. Index b-tree pages (types 2 and 10) are *refused with an
   error*, not misread. Every query is a full table scan, so a `WHERE` on a
   50,000-row table reads all 50,000 rows.
-- **No `WITHOUT ROWID` tables.** They are index b-trees. sqlr detects them from
-  the CREATE statement and errors out rather than printing something wrong.
-- **No WAL replay.** A `-wal` file is ignored entirely. A cleanly closed
+- No `WITHOUT ROWID` tables. They are index b-trees. sqlr detects them from
+  the CREATE statement and errors out instead of printing something wrong.
+- No WAL replay. A `-wal` file is ignored entirely. A cleanly closed
   WAL-mode database has been checkpointed and reads correctly (the harness
   asserts this), but a database with a live, un-checkpointed `-wal` reads as its
-  last checkpoint -- **the one silent wrong-answer mode left in sqlr.** Fixing it
+  last checkpoint, the one silent wrong-answer mode left in sqlr. Fixing it
   is item 09 in PLAN.md.
-- **No writes.** Not a limitation; it is the point.
-- **No joins, no ORDER BY, no LIMIT, no aggregates, no AND/OR, no expressions,
-  no `LIKE`, no `IN`.** One optional `WHERE` term comparing one column to one
+- No writes. Not a limitation. It is the point.
+- No joins, no ORDER BY, no LIMIT, no aggregates, no AND/OR, no expressions,
+  no `LIKE`, no `IN`. One optional `WHERE` term comparing one column to one
   literal. Anything else is refused with a message, never silently ignored.
-- **No views, triggers or virtual tables.** `.schema` prints their SQL because it
+- No views, triggers or virtual tables. `.schema` prints their SQL because it
   prints every `sqlite_schema` row's SQL, but you cannot query them.
-- **No UTF-16 databases.** Rejected at open time.
-- **No `COLLATE`.** Text comparison is `memcmp`, i.e. BINARY. A column declared
+- No UTF-16 databases. Rejected at open time.
+- No `COLLATE`. Text comparison is `memcmp`, i.e. BINARY. A column declared
   `COLLATE NOCASE` will compare case-sensitively, which is a wrong answer; the
   corpus does not use one.
-- **No column DEFAULT values.** A column added by `ALTER TABLE ADD COLUMN ... 
+- No column DEFAULT values. A column added by `ALTER TABLE ADD COLUMN ... 
   DEFAULT 5` reads as NULL in rows written before the ALTER, where SQLite reads
   5. The corpus adds columns without defaults.
-- **`INTEGER PRIMARY KEY DESC` is not treated as a rowid alias**, which matches
+- `INTEGER PRIMARY KEY DESC` is not treated as a rowid alias, which matches
   SQLite, but the detection is textual and would be confused by an unusual
   spelling.
-- **The whole file is read into memory.** A 10 GB database needs 10 GB of RAM.
-- **The CREATE-statement parser is a shape-matcher, not an SQL parser.** It
+- The whole file is read into memory. A 10 GB database needs 10 GB of RAM.
+- The CREATE-statement parser is a shape-matcher, not an SQL parser. It
   handles everything SQLite itself emits, and the corpus pushes on it, but exotic
   DDL (generated columns, a DEFAULT containing an unbalanced quote) will confuse
   it.
-- **TSV output is not escaped.** A text value containing a tab or a newline
+- TSV output is not escaped. A text value containing a tab or a newline
   produces ambiguous TSV, exactly as `sqlite3 -tabs` does. Use `--json` for
   values like that; JSON output escapes control characters properly.
-- **A BLOB and a text value spelling `X'41'` render identically.** Blobs use
+- A BLOB and a text value spelling `X'41'` render identically. Blobs use
   SQLite's `X'HEX'` literal form in both output modes.
 
 Every deliberate shortcut is marked in the source with a `shortcut:` comment
