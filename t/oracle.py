@@ -17,6 +17,7 @@ import ctypes
 import ctypes.util
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -186,6 +187,43 @@ def oracle_dbinfo(db):
         conn.close()
 
 
+def oracle_indexes(db):
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type='index' AND rootpage > 0"
+            " ORDER BY name"
+        ).fetchall()
+        return b"".join(r[0].encode() + b"\n" for r in rows)
+    finally:
+        conn.close()
+
+
+def oracle_index(db, name, sql):
+    """What the index b-tree holds, according to SQLite walking it.
+
+    The expected bytes are not an ORDER BY I reasoned out: `INDEXED BY` makes
+    SQLite traverse that index and emit its entries in the order they are
+    stored, which is the same walk sqlr does over the same pages. That is why
+    the plan is checked first -- if SQLite answered by sorting the table
+    instead, the comparison would be against my idea of the index order rather
+    than against the index, and a DESC or COLLATE NOCASE index is exactly
+    where that idea goes wrong.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        plan = " | ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
+        check(re.search(r"\bINDEX %s\b" % re.escape(name), plan) is not None,
+              "%s: SQLite answers the %s oracle query by walking that index"
+              % (os.path.basename(db), name), plan)
+        out = bytearray()
+        for r in conn.execute(sql):
+            out += b"\t".join(o_tsv_val(conn, v) for v in r) + b"\n"
+        return bytes(out)
+    finally:
+        conn.close()
+
+
 def oracle_schema(db):
     conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
     try:
@@ -307,6 +345,34 @@ def check_btree_shape(db, table, levels, internal, leaf):
           "dbstat says depth %d, %d interior, %d leaf" % got)
 
 
+def check_index_pages(db, name, overflow=False):
+    """Assert that an index fixture really grew an INTERIOR page (type 2).
+
+    An index that fits on one page is all type 10, and a suite that only ever
+    sees leaf pages has not tested the interior cell format at all -- which is
+    the one that carries a key and a child pointer in the same cell. SQLite
+    decides how many rows fit, so the fixture has to be measured, not assumed.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        counts = dict(conn.execute(
+            "SELECT pagetype, count(*) FROM dbstat WHERE name = ? GROUP BY pagetype",
+            (name,)).fetchall())
+    except sqlite3.OperationalError as e:
+        check(False, "%s/%s index page mix" % (os.path.basename(db), name),
+              "dbstat unavailable in this SQLite build: %s" % e)
+        return
+    finally:
+        conn.close()
+    ok = counts.get("internal", 0) >= 1 and counts.get("leaf", 0) >= 2
+    want = "interior and leaf pages"
+    if overflow:
+        ok = ok and counts.get("overflow", 0) >= 1
+        want = "interior, leaf and overflow pages"
+    check(ok, "%s: index %s has %s" % (os.path.basename(db), name, want),
+          "dbstat says %r" % (counts,))
+
+
 CASES = []  # (dbpath, argv_tail, sql_for_oracle_or_None, kind)
 
 
@@ -316,6 +382,11 @@ def q(db, sql, json=False):
 
 def meta(db, which):
     CASES.append((db, [db, which], None, which))
+
+
+def idx(db, name, sql):
+    """Compare sqlr's dump of one index b-tree against SQLite's walk of it."""
+    CASES.append((db, [db, ".index", name], sql, "index"))
 
 
 def build_corpus():
@@ -332,6 +403,7 @@ def build_corpus():
     meta(db, ".tables")
     meta(db, ".schema")
     meta(db, ".dbinfo")
+    meta(db, ".indexes")  # a database with no index at all: no output
     q(db, "SELECT * FROM vacant")
     q(db, "SELECT * FROM vacant", json=True)
     q(db, "SELECT * FROM one")
@@ -519,16 +591,93 @@ def build_corpus():
         q(db, "SELECT t FROM s WHERE i = 299")
         meta(db, ".dbinfo")
 
-    # 8. An index exists; sqlr ignores it and scans. Queries are chosen so the
-    #    answer is order-identical whether SQLite uses the index or not.
+    # 8. The degenerate index: four entries, so the whole b-tree is one leaf
+    #    page and there is no interior page anywhere. A table scan over the
+    #    same table must still ignore the index and give the same answer.
     db = make("indexed", """
         CREATE TABLE ix(k TEXT, v INTEGER);
         INSERT INTO ix VALUES('a',1),('b',2),('c',3),('a',4);
         CREATE INDEX ix_k ON ix(k);
     """)
     meta(db, ".schema")
+    meta(db, ".indexes")
+    idx(db, "ix_k", "SELECT k, rowid FROM ix INDEXED BY ix_k")
     q(db, "SELECT * FROM ix")
     q(db, "SELECT * FROM ix WHERE k = 'a'")
+
+    # 8b. Index b-trees with interior pages. 2,000 rows is enough that every
+    #     index here is two levels, which is the point: an index interior cell
+    #     carries a KEY as well as a child pointer, unlike a table interior
+    #     cell, and a corpus of single-page indexes never exercises it. The
+    #     shape is asserted from dbstat below rather than assumed.
+    #
+    #     The columns are chosen for the decisions each one forces: a REAL
+    #     column, because SQLite shrinks an integral float to an integer
+    #     serial type inside an index exactly as it does inside a table, so
+    #     the index dump needs the column's affinity to print 0.0 and not 0;
+    #     a BLOB column, which sorts after every text value; NULLs, which sort
+    #     before everything; a COLLATE NOCASE index and a DESC index, whose
+    #     stored order is neither the table's nor plain byte order.
+    rnd = random.Random(20261018)
+    emp = []
+    for i in range(2000):
+        nm = None if i % 97 == 0 else ("N%04d" if i % 3 else "n%04d") % rnd.randrange(3000)
+        emp.append((nm, "d%d" % (i % 5), float(i % 7) * 50, bytes([i % 256, (i * 7) % 256])))
+    db = make("idx", """
+        CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, dept TEXT,
+                         salary REAL, tag BLOB);
+    """, rows=[("INSERT INTO emp(name,dept,salary,tag) VALUES(?,?,?,?)", emp)],
+         extra="""
+        CREATE INDEX i_name ON emp(name);
+        CREATE INDEX i_dept_sal ON emp(dept, salary);
+        CREATE UNIQUE INDEX i_uid ON emp(name, id);
+        CREATE INDEX i_nocase ON emp(name COLLATE NOCASE);
+        CREATE INDEX i_desc ON emp(name DESC);
+        CREATE INDEX i_sal ON emp(salary);
+        CREATE INDEX i_tag ON emp(tag);
+        CREATE INDEX i_part ON emp(dept) WHERE salary > 100;
+    """)
+    meta(db, ".indexes")
+    for name in ("i_name", "i_dept_sal", "i_uid", "i_nocase", "i_desc", "i_sal",
+                 "i_tag", "i_part"):
+        check_index_pages(db, name)
+    idx(db, "i_name", "SELECT name, rowid FROM emp INDEXED BY i_name")
+    idx(db, "i_dept_sal", "SELECT dept, salary, rowid FROM emp INDEXED BY i_dept_sal")
+    idx(db, "i_uid", "SELECT name, id, rowid FROM emp INDEXED BY i_uid")
+    idx(db, "i_nocase", "SELECT name, rowid FROM emp INDEXED BY i_nocase")
+    idx(db, "i_desc", "SELECT name, rowid FROM emp INDEXED BY i_desc")
+    idx(db, "i_sal", "SELECT salary, rowid FROM emp INDEXED BY i_sal")
+    idx(db, "i_tag", "SELECT tag, rowid FROM emp INDEXED BY i_tag")
+    idx(db, "i_part", "SELECT dept, rowid FROM emp INDEXED BY i_part WHERE salary > 100")
+    q(db, "SELECT id, name FROM emp WHERE id = 1999")
+
+    # 8c. Index payloads that overflow, on 512-byte pages. The local-payload
+    #     threshold X is NOT the same on an index page as on a table leaf: it
+    #     is 64/255ths of the usable space minus 23, about 102 bytes here,
+    #     where a table leaf keeps 477. A 300-byte key therefore spills on an
+    #     index page and not on the table page holding the same string, so a
+    #     parser that reuses the table formula reads every long key wrong.
+    #     The interior page's own cells carry keys too, and those overflow as
+    #     well, which is what makes this fixture reach the overflow reader
+    #     from an interior cell.
+    #
+    #     The same database carries an auto-index: a UNIQUE constraint makes
+    #     SQLite build sqlite_autoindex_u_1, whose sqlite_schema row has no
+    #     SQL at all, so its key columns cannot be read from a statement.
+    db = make("ixovf", """
+        CREATE TABLE lk(k TEXT);
+        CREATE TABLE u(k TEXT UNIQUE, v INTEGER);
+    """, rows=[("INSERT INTO lk VALUES(?)",
+                [("L%03d-" % i + "x" * 300,) for i in range(60)]),
+               ("INSERT INTO u VALUES(?,?)",
+                [("key%03d" % i, i) for i in range(400)])],
+         extra="CREATE INDEX ix_long ON lk(k);", page_size=512)
+    meta(db, ".indexes")
+    check_index_pages(db, "ix_long", overflow=True)
+    check_index_pages(db, "sqlite_autoindex_u_1")
+    idx(db, "ix_long", "SELECT k, rowid FROM lk INDEXED BY ix_long")
+    idx(db, "sqlite_autoindex_u_1",
+        "SELECT k, rowid FROM u INDEXED BY sqlite_autoindex_u_1")
 
     # 9. Identifiers and declared types that stress the CREATE-statement
     #    shape-matcher: quoted names, a comma inside a type, table constraints
@@ -603,9 +752,14 @@ def compare_cases():
             want = oracle_dbinfo(db)
         elif kind == ".schema":
             want = oracle_schema(db)
+        elif kind == ".indexes":
+            want = oracle_indexes(db)
+        elif kind == "index":
+            want = oracle_index(db, argv[-1], sql)
         else:
             want = oracle_query(db, sql, kind == "json")
-        label = "%s :: %s" % (os.path.basename(db), " ".join(argv[len(argv) - 1:]))
+        n = 2 if kind == "index" else 1
+        label = "%s :: %s" % (os.path.basename(db), " ".join(argv[len(argv) - n:]))
         if p.returncode != 0:
             check(False, label, "sqlr exited %d: %s" % (p.returncode, p.stderr.decode()[:300]))
             continue
@@ -627,12 +781,33 @@ def compare_cases():
 
 def refusals():
     db = make("wor", """
-        CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;
-        INSERT INTO w VALUES('a',1),('b',2);
+        CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER, u TEXT UNIQUE) WITHOUT ROWID;
+        INSERT INTO w VALUES('a',1,'x'),('b',2,'y');
+        CREATE INDEX wi ON w(v);
     """)
     p = run([db, "SELECT * FROM w"])
     check(p.returncode == 1 and b"WITHOUT ROWID" in p.stderr,
           "WITHOUT ROWID table is refused loudly",
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+
+    # An index on a WITHOUT ROWID table is a readable b-tree whose entries end
+    # with the table's primary key instead of a rowid. Dumping one would print
+    # something that looks right and is not, so it is refused -- including the
+    # auto-index, which has no CREATE statement and so has to be refused via
+    # its table rather than via its own SQL.
+    for which in ("wi", "sqlite_autoindex_w_2"):
+        p = run([db, ".index", which])
+        check(p.returncode == 1 and b"WITHOUT ROWID" in p.stderr,
+              "index %s on a WITHOUT ROWID table is refused loudly" % which,
+              "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+
+    p = run([db, ".index", "nosuchindex"])
+    check(p.returncode == 1 and b"no such index" in p.stderr,
+          "refusal: .index on a name that is not an index",
+          "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
+    p = run([db, ".index", "w"])
+    check(p.returncode == 1 and b"no such index" in p.stderr,
+          "refusal: .index on a table name",
           "rc=%d err=%r" % (p.returncode, p.stderr[:200]))
 
     db2 = CASES[0][0]
@@ -721,12 +896,32 @@ def truncation_sweep(src, cmds, psize, nspread):
           "%s: %d truncation offsets x %d commands error cleanly"
           % (os.path.basename(src), len(offsets), len(cmds)),
           "\n    ".join(bad[:8]))
-    return whole, size
+
+
+def corruption_sweep(src, cmds, trials, seed, limit=None):
+    """Flip one byte and require an error, never a crash and never a hang."""
+    with open(src, "rb") as f:
+        whole = f.read()
+    victim = os.path.join(WORK, "corrupt.db")
+    rnd = random.Random(seed)
+    bad = []
+    for _ in range(trials):
+        off = rnd.randrange(0, min(len(whole), limit) if limit else len(whole))
+        b = bytearray(whole)
+        b[off] = rnd.randrange(256)
+        with open(victim, "wb") as f:
+            f.write(bytes(b))
+        c = rnd.choice(cmds)
+        p = run([victim] + c, timeout=30)
+        if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
+            bad.append("flip@%d %s -> rc=%d %r" % (off, c[0], p.returncode, p.stderr[:300]))
+    check(not bad, "%s: %d single-byte corruptions error cleanly"
+          % (os.path.basename(src), trials), "\n    ".join(bad[:8]))
 
 
 def robustness():
     # types.db: 4 KiB pages, every storage class, one b-tree level.
-    whole, size = truncation_sweep(
+    truncation_sweep(
         os.path.join(WORK, "types.db"),
         [[".tables"], [".schema"], ["SELECT * FROM allt"],
          ["SELECT i FROM allt WHERE i = 7"]], 4096, 120)
@@ -738,30 +933,34 @@ def robustness():
     truncation_sweep(os.path.join(WORK, "deep.db"),
                      [[".schema"], ["SELECT * FROM d"],
                       ["SELECT id FROM d WHERE id = 50000"]], 512, 150)
-
-    src = os.path.join(WORK, "types.db")
-    victim = os.path.join(WORK, "trunc.db")
-    cmds = [[".dbinfo"], [".tables"], [".schema"], ["SELECT * FROM allt"],
-            ["SELECT i FROM allt WHERE i = 7"]]
+    # ixovf.db: index interior pages, index leaves and the overflow chains
+    #     hanging off both, so truncation cuts an index cell in half as well
+    #     as a table one. The index reader has its own cell format and its
+    #     own payload threshold; neither is reached by the three sweeps
+    #     above, all of which run over table b-trees only.
+    truncation_sweep(os.path.join(WORK, "ixovf.db"),
+                     [[".indexes"], [".index", "ix_long"],
+                      [".index", "sqlite_autoindex_u_1"]], 512, 120)
 
     # Single-byte corruption across the first few pages: page types, cell
     # counts, cell pointers and record varints all live here, and a wrong value
     # must not become a wild read or an endless loop.
-    rnd = random.Random(20261005)
-    bad = []
-    trials = 500
-    for _ in range(trials):
-        off = rnd.randrange(0, min(size, 16384))
-        b = bytearray(whole)
-        b[off] = rnd.randrange(256)
-        with open(victim, "wb") as f:
-            f.write(bytes(b))
-        c = rnd.choice(cmds)
-        p = run([victim] + c, timeout=30)
-        if p.returncode not in (0, 1) or b"Sanitizer" in p.stderr or b"runtime error" in p.stderr:
-            bad.append("flip@%d %s -> rc=%d %r" % (off, c[0], p.returncode, p.stderr[:300]))
-    check(not bad, "%d single-byte corruptions error cleanly" % trials,
-          "\n    ".join(bad[:8]))
+    corruption_sweep(os.path.join(WORK, "types.db"),
+                     [[".dbinfo"], [".tables"], [".schema"], ["SELECT * FROM allt"],
+                      ["SELECT i FROM allt WHERE i = 7"]], 500, 20261005, 16384)
+    # The same over a database of index pages, with no limit on where the
+    # flip lands, so index cell pointers and index payload lengths get the
+    # same treatment. The sweep above cannot reach them: types.db has no
+    # index, and .index is not one of its commands.
+    corruption_sweep(os.path.join(WORK, "ixovf.db"),
+                     [[".indexes"], [".index", "ix_long"],
+                      [".index", "sqlite_autoindex_u_1"],
+                      ["SELECT * FROM u WHERE v = 7"]], 300, 20261018)
+
+    with open(os.path.join(WORK, "types.db"), "rb") as f:
+        whole = f.read()
+    cmds = [[".dbinfo"], [".tables"], [".schema"], ["SELECT * FROM allt"],
+            ["SELECT i FROM allt WHERE i = 7"]]
 
     # Hand-built hostile files, including the cycles a visited-page bitmap has
     # to catch: a b-tree root that is its own child, and a self-linked overflow
@@ -794,6 +993,67 @@ def robustness():
                 break
         if okall:
             check(True, "degenerate %s errors cleanly" % name)
+
+
+def index_page_corruptions():
+    """A page's type byte and the rootpage sqlite_schema records for it are two
+    separate claims about the same page, and a corrupt file makes them
+    disagree. Decoding an index cell as a table cell would read a child
+    pointer as a payload length, so the mismatch has to be an error.
+
+    The third file here is the one that pays for the two visited-page bitmaps.
+    An overflow chain is followed in the middle of a b-tree walk, and while
+    both shared one bitmap, reading a long value erased the record of every
+    page the walk had already visited. On a table that is nearly unreachable,
+    because a table interior cell has no payload to overflow; on an index it
+    is ordinary, because every interior cell carries a key. With one bitmap
+    this file reports "deeper than 40 levels" after emitting the same pages
+    forty times over; with two it is caught on the first revisit.
+    """
+    src = os.path.join(WORK, "ixovf.db")
+    psize = 512
+    conn = sqlite3.connect("file:%s?mode=ro" % src, uri=True)
+    roots = dict(conn.execute(
+        "SELECT name, rootpage FROM sqlite_schema WHERE name IN ('ix_long','lk')"))
+    conn.close()
+    with open(src, "rb") as f:
+        whole = f.read()
+    victim = os.path.join(WORK, "ixbad.db")
+    iroot, troot = roots["ix_long"], roots["lk"]
+    ioff, toff = (iroot - 1) * psize, (troot - 1) * psize
+
+    # Before corrupting anything: the fixture must really contain a type 2
+    # page and a type 5 page, read out of the file rather than inferred.
+    check(whole[ioff] == 2,
+          "ixovf: the ix_long root is an index interior page (type 2)",
+          "page %d type byte is %d" % (iroot, whole[ioff]))
+    check(whole[toff] == 5,
+          "ixovf: the lk root is a table interior page (type 5)",
+          "page %d type byte is %d" % (troot, whole[toff]))
+
+    def attack(name, patch, argv, needle):
+        b = bytearray(whole)
+        patch(b)
+        with open(victim, "wb") as f:
+            f.write(bytes(b))
+        p = run([victim] + argv, timeout=30)
+        check(p.returncode == 1 and needle in p.stderr
+              and b"Sanitizer" not in p.stderr and b"runtime error" not in p.stderr,
+              "corrupt ixovf: %s" % name,
+              "rc=%d err=%r" % (p.returncode, p.stderr[:300]))
+
+    def settype(off, t):
+        return lambda b: b.__setitem__(off, t)
+
+    attack("an index root whose page says table leaf", settype(ioff, 13),
+           [".index", "ix_long"], b"table b-tree page but an index")
+    attack("a table root whose page says index leaf", settype(toff, 10),
+           ["SELECT * FROM lk"], b"index b-tree page but a table")
+
+    def selfchild(b):
+        b[ioff + 8:ioff + 12] = iroot.to_bytes(4, "big")
+    attack("an index interior page that is its own right-most child", selfchild,
+           [".index", "ix_long"], b"revisits page")
 
 
 def readonly_check():
@@ -834,6 +1094,7 @@ def main():
 
         compare_cases()
         refusals()
+        index_page_corruptions()
         readonly_check()
         print("robustness: truncating and corrupting ...")
         robustness()

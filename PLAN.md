@@ -8,6 +8,8 @@ it, without linking libsqlite3 and without ever writing a byte.
     sqlr DB.sqlite .dbinfo            # header fields, one per line, as name<TAB>value
     sqlr DB.sqlite .tables            # table names, one per line, sorted
     sqlr DB.sqlite .schema            # each CREATE statement, semicolon-terminated
+    sqlr DB.sqlite .indexes           # index names, one per line, sorted
+    sqlr DB.sqlite .index NAME        # that index's b-tree, in key order, as TSV
     sqlr [--json] DB.sqlite 'SELECT'  # rows, as TSV (default) or JSON
 
 The query grammar is exactly:
@@ -19,6 +21,13 @@ Literals are integers, reals, `'text'` (with `''` escapes), `X'hex'` and `NULL`.
 `.dbinfo` reports page size, page count, reserved bytes, text encoding, schema
 cookie, user version and freelist page count, every one of which SQLite also
 reports through a PRAGMA, so the header parse is checked field by field.
+
+`.indexes` lists every row of `sqlite_schema` whose type is `index`, including
+the `sqlite_autoindex_*` ones SQLite builds for UNIQUE and PRIMARY KEY
+constraints. `.index NAME` prints one line per index entry: the indexed
+columns in index order, then the rowid of the table row the entry points at.
+The sqlite3 shell has no equivalent of `.index`, so the format is sqlr's, but
+the content is compared against SQLite walking the same index.
 
 `rowid`, `_rowid_` and `oid` are selectable and usable in `WHERE`. Everything
 else (joins, ORDER BY, LIMIT, aggregates, AND/OR, expressions) is refused with
@@ -61,8 +70,16 @@ Ranked, strongest first.
    decision that could hide a sqlr bug is pushed back into SQLite: REAL text
    comes from SQLite's `CAST(x AS TEXT)` and blob hex from SQLite's `hex()`, so
    `put_real()` and `put_blob()` are checked against SQLite's own
-   formatting, not against a Python reimplementation of it. 89 comparison cases over
-   20 databases.
+   formatting, not against a Python reimplementation of it. 113 comparison cases over
+   23 databases.
+
+   For an index the expected bytes are not an ORDER BY worked out by hand.
+   `INDEXED BY` makes SQLite traverse that index and emit its entries in
+   stored order, and `EXPLAIN QUERY PLAN` is checked first to confirm it did,
+   so the comparison is against the index rather than against an idea of what
+   the index order should be. A `COLLATE NOCASE` index and a `DESC` index are
+   in the corpus precisely because that idea is where a hand-written ORDER BY
+   goes wrong.
 
    The `sqlite3` command-line shell is not installed in this environment, so
    SQLite is reached through python3's stdlib binding to the same libsqlite3
@@ -82,8 +99,9 @@ Ranked, strongest first.
 
 ## Non-goals
 
-Writing, in any form. Indexes, every query is a full table scan, and an index
-b-tree page is refused, not misread. WAL replay. A `-wal` file is ignored,
+Writing, in any form. Using an index to answer a query: index b-trees are
+read and dumped, but every `SELECT` is still a full table scan, which is
+item 07. WAL replay. A `-wal` file is ignored,
 so an un-checkpointed database reads as its last checkpoint. `WITHOUT ROWID`
 tables, which are index b-trees. UTF-16 databases. Joins, aggregates, ORDER BY,
 LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
@@ -154,10 +172,28 @@ LIMIT, expressions, more than one WHERE term. Being fast. Being a library.
 
 ### Milestone 1: read more of the format
 
-- [ ] 06 index b-trees: decode page types 2 and 10, so `.indexes` and an
+- [x] 06 index b-trees: decode page types 2 and 10, so `.indexes` and an
       index-covered scan become possible
       why: the index is half the file format and sqlr currently refuses it; this
            is the largest remaining gap between sqlr and "reads a SQLite file"
+      done: one walk() for both kinds of tree, differing in the page types, the
+           key an index interior cell carries alongside its child pointer, and
+           the local-payload threshold, which on an index page is
+           ((U-12)*64/255)-23 and not U-35. `.indexes` and `.index NAME` added.
+           Rowid tables only: an index on a WITHOUT ROWID table ends its
+           entries with the primary key instead of a rowid and is refused, as
+           item 08. Eight indexes over 2,000 rows (single column, multi-column,
+           UNIQUE, COLLATE NOCASE, DESC, REAL, BLOB, partial) plus a 512-byte-page
+           fixture whose index keys overflow and an auto-index, all compared
+           against SQLite walking the same index under INDEXED BY, with
+           EXPLAIN QUERY PLAN asserting it really did. dbstat asserts each
+           fixture grew a type 2 page; one case reads the type byte out of the
+           file. 123 -> 171 checks. Two bugs fixed on the way: the b-tree walk
+           and the overflow reader shared one visited-page bitmap, so reading
+           a long value erased the walk's cycle detection, which an index
+           interior page hits on every cell; and rec_room rounded its
+           allocation up, which left ASan blind to a read one byte past an
+           assembled payload (measured, not assumed)
 - [ ] 07 use an index for an equality `WHERE` when one exists, falling back to
       the scan, and add a harness case asserting the two paths agree with each
       other as well as with SQLite
