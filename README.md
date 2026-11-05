@@ -100,14 +100,24 @@ four lines at the end. `t/` holds two files, `run.sh` and `oracle.py`, and
 that the suite does not reach. `make clean`, `make sqlr` and `make sqlr-asan`
 are the other targets and they build and delete only what their names say.
 
-The run used to print one number, `171 agree, 0 disagree`, and that number was
-wrong about itself. Counted by what the authority actually was, those 171 were
-136 agreements with SQLite, 11 refusals, 22 checks that a hostile file errors
+The figure to compare a run against is the total on the last line,
+
+320 checks, 0 failed
+
+and 192 of those are agreements with SQLite. The other three counters are not
+agreements with anything, which is why the run prints four lines instead of
+one.
+
+It used to print one, `171 agree, 0 disagree`, and that number was wrong about
+itself. Counted by what the authority actually was, those 171 were 136
+agreements with SQLite, 11 refusals, 22 checks that a hostile file errors
 cleanly or that the file was not written, and 2 that read a fixture's bytes
 against the format specification. So 35 of them were not agreements with
 anything, and adding another "sqlr correctly declines this" assertion pushed
-the agreement figure up. The four counters are the same `check()` with a
-`kind`, and the names say which authority each kind has.
+the agreement figure up. Those two numbers, 171 and 136, describe the suite as
+it was before the split and are kept for that reason; neither is a count of
+what runs now. The four counters are the same `check()` with a `kind`, and the
+names say which authority each kind has.
 
 ## Why this exists
 
